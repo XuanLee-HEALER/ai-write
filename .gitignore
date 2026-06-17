@@ -8,6 +8,9 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# Demo / runtime workspace output
+/workspace
+
 # macOS
 .DS_Store
 

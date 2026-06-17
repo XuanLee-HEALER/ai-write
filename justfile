@@ -45,3 +45,8 @@ doc:
 # 真机集成测试(读 .env 的 DEEPSEEK_API_KEY,跑 #[ignore] 的 live_* 用例)
 test-live:
     set -a; . ./.env; set +a; cargo test --all-features -- --ignored --nocapture
+
+# 真机 demo(读 .env 的 DEEPSEEK_API_KEY):Master 派一个 Slave 写一篇文章到 workspace/<主题>/
+# 用法:just demo "<主题>" "<写作任务>"
+demo theme task:
+    set -a; . ./.env; set +a; cargo run --bin demo -- "{{theme}}" "{{task}}"

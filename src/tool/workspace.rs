@@ -64,8 +64,27 @@ impl WriterId {
     /// Renders this writer as a stable provenance tag recorded in
     /// [`ArticleMeta::contributors`].
     ///
-    /// A human is `"human"`; an agent is `"<model>/<label>"`.
-    fn provenance_tag(&self) -> String {
+    /// A human is `"human"`; an agent is `"<model>/<label>"` (e.g.
+    /// `"deepseek-v4-pro/slave-1"`). This is the canonical file-level provenance
+    /// identity: it is what the workspace records in
+    /// [`ArticleMeta::contributors`], what the [`vcs`](crate::vcs) layer uses as
+    /// the git author name, and what the [`observe`](crate::observe) layer reports
+    /// as the author of an [`Event::EditCommitted`](crate::observe::Event::EditCommitted),
+    /// so a commit lines up one-to-one across all three.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ai_write::tool::workspace::WriterId;
+    ///
+    /// assert_eq!(WriterId::Human.provenance_tag(), "human");
+    /// let agent = WriterId::Agent {
+    ///     model: "deepseek-v4-pro".to_string(),
+    ///     label: "slave-1".to_string(),
+    /// };
+    /// assert_eq!(agent.provenance_tag(), "deepseek-v4-pro/slave-1");
+    /// ```
+    pub fn provenance_tag(&self) -> String {
         match self {
             WriterId::Human => "human".to_string(),
             WriterId::Agent { model, label } => format!("{model}/{label}"),
@@ -526,6 +545,42 @@ impl Workspace {
         std::fs::write(&path, text)
             .map_err(|e| ToolError::Io(format!("cannot write `{theme}/{file_name}`: {e}")))?;
         self.record_contribution(theme, file_name, writer)
+    }
+
+    /// Confirms that `writer` currently holds the lock on an article, erroring
+    /// otherwise.
+    ///
+    /// This is the public form of the internal lock check used by the
+    /// lock-guarded editors. Tools that mutate an article through a side channel
+    /// (for example the version-control undo, which rewrites the file via
+    /// [`Vcs`](crate::vcs::Vcs) rather than [`Workspace::write_article`]) call it
+    /// to uphold the single-writer invariant before touching the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Lock`] if `writer` does not hold the article lock, or
+    /// a sandbox / name error if the names are invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use ai_write::tool::workspace::{Workspace, WriterId};
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let mut ws = Workspace::open(dir.path()).unwrap();
+    /// ws.create_theme("t").unwrap();
+    /// ws.create_article("t", "a.md", "A", None).unwrap();
+    /// ws.acquire_lock("t", "a.md", &WriterId::Human).unwrap();
+    /// assert!(ws.ensure_lock_held("t", "a.md", &WriterId::Human).is_ok());
+    /// ```
+    pub fn ensure_lock_held(
+        &self,
+        theme: &str,
+        file_name: &str,
+        writer: &WriterId,
+    ) -> Result<(), ToolError> {
+        Self::validate_name("theme", theme)?;
+        Self::validate_name("article", file_name)?;
+        self.require_lock(theme, file_name, writer)
     }
 
     /// Acquires the single-writer lock on an article for `writer`.

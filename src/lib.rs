@@ -14,3 +14,21 @@ pub mod engine;
 pub mod session;
 #[cfg(feature = "blocking")]
 pub mod tool;
+
+// Version control for the workspace: each successful edit is committed to a git
+// repository via libgit2 (`git2`), giving the workspace history, diff, and undo.
+// Synchronous, built on the `blocking` layer alongside the workspace.
+#[cfg(feature = "blocking")]
+pub mod vcs;
+
+// Observability: a push-based event stream (`Event` + `EventSink`) that lets the
+// session and engine narrate the AI writing process to a UI. Default sink is a
+// no-op, so it is transparent to code that does not opt in.
+#[cfg(feature = "blocking")]
+pub mod observe;
+
+// The presentation WebUI backend: an `axum` + SSE server that visualizes the AI
+// writing process. Strictly feature-gated (`webui`) and built on the synchronous
+// `blocking` layer, bridged to async via `spawn_blocking` + a broadcast channel.
+#[cfg(feature = "webui")]
+pub mod webui;

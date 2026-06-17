@@ -25,15 +25,22 @@
 //! [`req`]: crate::req
 //! [`Client`]: crate::req::blocking::Client
 
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::observe::{Event, EventSink, NullSink};
 use crate::req::blocking::Client;
 use crate::req::{ChatRequest, FinishReason, Message, Model, Thinking, ToolChoice, Usage};
 use crate::tool::workspace::{Workspace, WriterId};
 use crate::tool::{ToolCtx, ToolRegistry};
+use crate::vcs::Vcs;
+
+/// The maximum number of system-prompt characters carried in an
+/// [`Event::SessionStarted`] excerpt, to keep the event small for a UI.
+const SYSTEM_EXCERPT_LEN: usize = 200;
 
 /// Cumulative token usage across every round of a [`Session`].
 ///
@@ -206,6 +213,32 @@ pub struct Session {
     /// [`Session::set_workspace`] resets it to `None` so a new root re-opens.
     /// Never part of a [`SessionSnapshot`].
     workspace: Option<Workspace>,
+    /// The workspace's version-control handle, opened lazily alongside
+    /// [`workspace`](Session::workspace) at the same root and reused for the rest
+    /// of the session. It is what turns each successful edit into a git commit
+    /// authored by the session's [`writer`](Session::writer). Reset to `None` by
+    /// [`Session::set_workspace`] so a new root re-opens its own repository, and
+    /// never part of a [`SessionSnapshot`]. A `Vcs` wraps a non-`Sync`
+    /// [`git2::Repository`](git2::Repository), but each session (and thus each
+    /// slave thread) owns its own handle, so nothing is shared across threads.
+    vcs: Option<Vcs>,
+    /// The push-based observability sink. Defaults to [`NullSink`] (every event
+    /// discarded), so observability is transparent to callers that never install
+    /// a real sink — the v0 offline tests are unaffected. The
+    /// [`engine`](crate::engine) and WebUI layers install a sink with
+    /// [`Session::set_event_sink`] to render the live operation feed. Held as an
+    /// `Arc<dyn EventSink>` so it can be cloned to a slave thread and emitted to
+    /// concurrently. Never part of a [`SessionSnapshot`].
+    events: Arc<dyn EventSink>,
+    /// A short role label (e.g. `"slave"`) carried in the
+    /// [`Event::SessionStarted`] this session emits on its first round. Defaults
+    /// to `"session"`; the engine sets it per role.
+    role: String,
+    /// The 1-based round counter for the current run, incremented at the start of
+    /// every [`Session::run_round`] and reported in [`Event::RoundStarted`]. It is
+    /// `0` before the first round; the transition `0 → 1` is what triggers the
+    /// once-per-run [`Event::SessionStarted`].
+    round: u32,
 }
 
 impl Session {
@@ -247,6 +280,10 @@ impl Session {
             workspace_root: std::path::PathBuf::from("workspace"),
             writer: WriterId::Human,
             workspace: None,
+            vcs: None,
+            events: Arc::new(NullSink),
+            role: "session".to_string(),
+            round: 0,
         }
     }
 
@@ -264,9 +301,41 @@ impl Session {
     ) -> &mut Self {
         self.workspace_root = workspace_root.into();
         self.writer = writer;
-        // Drop any cached handle so the next tool round re-opens at the new root.
+        // Drop any cached handles so the next tool round re-opens both the
+        // workspace and its version-control repository at the new root.
         self.workspace = None;
+        self.vcs = None;
         self
+    }
+
+    /// Installs an [`EventSink`] so this session narrates its run as a stream of
+    /// [`Event`]s, and tags the session with a short `role` label for
+    /// [`Event::SessionStarted`].
+    ///
+    /// By default a session emits to a [`NullSink`] (every event discarded), so
+    /// observability is opt-in: the [`engine`](crate::engine) and WebUI layers
+    /// call this to render the live operation feed, while ordinary callers and the
+    /// offline tests leave it unset and observe no behavioural change. The sink is
+    /// shared (`Arc`), so the same one can be installed on a master and all its
+    /// slaves to multiplex their events into one feed. Returns the session for
+    /// chaining.
+    pub fn set_event_sink(
+        &mut self,
+        role: impl Into<String>,
+        events: Arc<dyn EventSink>,
+    ) -> &mut Self {
+        self.role = role.into();
+        self.events = events;
+        self
+    }
+
+    /// Returns a clone of the installed [`EventSink`] handle.
+    ///
+    /// Cloning an `Arc<dyn EventSink>` is cheap (a refcount bump). The
+    /// [`engine`](crate::engine) layer uses this to hand a master's sink to a
+    /// spawned slave, so both fan their events into the same downstream consumer.
+    pub fn event_sink(&self) -> Arc<dyn EventSink> {
+        Arc::clone(&self.events)
     }
 
     /// Appends a `user` message to the history.
@@ -290,15 +359,26 @@ impl Session {
     /// than as an `Err`, so a single signature covers both control flow and
     /// failure. Transient errors are retried internally.
     pub fn run_round(&mut self) -> Step {
+        // Advance the round counter and announce the round (and, on the very
+        // first round of this session, that the session itself started).
+        self.round += 1;
+        if self.round == 1 {
+            self.events.emit(Event::SessionStarted {
+                role: self.role.clone(),
+                system_excerpt: system_excerpt(&self.system),
+            });
+        }
+        self.events.emit(Event::RoundStarted { round: self.round });
+
         let request = match self.build_request() {
             Ok(req) => req,
-            Err(e) => return Step::Failed(e),
+            Err(e) => return self.finish(Step::Failed(e)),
         };
 
         // One chat completion, retrying transient errors with a small backoff.
         let response = match self.chat_with_retries(&request) {
             Ok(resp) => resp,
-            Err(e) => return Step::Failed(e),
+            Err(e) => return self.finish(Step::Failed(e)),
         };
 
         // Fold this round's usage into the running totals before branching.
@@ -310,12 +390,12 @@ impl Session {
         }
 
         let Some(choice) = response.choices.into_iter().next() else {
-            return Step::Failed(crate::req::Error::Decode {
+            return self.finish(Step::Failed(crate::req::Error::Decode {
                 context: "chat",
                 source: <serde_json::Error as serde::de::Error>::custom(
                     "chat response contained no choices",
                 ),
-            });
+            }));
         };
 
         // Back-fill the assistant turn (reasoning_content stripped) into history.
@@ -324,7 +404,13 @@ impl Session {
         let tool_calls = assistant.tool_calls.clone();
         self.history.push(assistant);
 
-        match choice.finish_reason {
+        // Surface any assistant text the model produced this round, whether it is
+        // an intermediate message, a final answer, or the preamble to a tool call.
+        if !text.is_empty() {
+            self.events.emit(Event::ModelMessage { text: text.clone() });
+        }
+
+        let step = match choice.finish_reason {
             Some(FinishReason::ToolCalls) => self.dispatch_tool_calls(tool_calls),
             Some(FinishReason::Stop) | None => Step::Done(text),
             Some(FinishReason::Length) => Step::Message(text),
@@ -334,7 +420,30 @@ impl Session {
             Some(FinishReason::InsufficientSystemResource) | Some(FinishReason::Unknown(_)) => {
                 Step::NeedHuman
             }
-        }
+        };
+        self.finish(step)
+    }
+
+    /// Emits an [`Event::Finished`] for `step` when it is a terminal outcome
+    /// ([`Step::Done`] / [`Step::NeedHuman`] / [`Step::Failed`]), then returns
+    /// `step` unchanged.
+    ///
+    /// Non-terminal steps ([`Step::Tool`] / [`Step::Message`]) emit nothing — the
+    /// run continues, so it has not finished. This keeps every exit path of
+    /// [`Session::run_round`] funnelled through one place, so a `Finished` event
+    /// is emitted exactly once per terminal round regardless of which branch
+    /// produced it.
+    fn finish(&self, step: Step) -> Step {
+        let outcome = match &step {
+            Step::Done(_) => "done",
+            Step::NeedHuman => "need_human",
+            Step::Failed(_) => "failed",
+            Step::Tool(_) | Step::Message(_) => return step,
+        };
+        self.events.emit(Event::Finished {
+            outcome: outcome.to_string(),
+        });
+        step
     }
 
     /// Runs rounds until the session reaches a terminal step
@@ -417,6 +526,10 @@ impl Session {
             workspace_root: std::path::PathBuf::from("workspace"),
             writer: WriterId::Human,
             workspace: None,
+            vcs: None,
+            events: Arc::new(NullSink),
+            role: "session".to_string(),
+            round: 0,
         }
     }
 
@@ -474,6 +587,12 @@ impl Session {
     /// as the content of every pending `tool` reply (rather than aborting the
     /// session), so the model can adapt — consistent with the "guard rails in the
     /// tools, recovery in the model" contract.
+    ///
+    /// A [`Vcs`] is opened lazily at the same root and attached to each
+    /// [`ToolCtx`], so a successful content edit is recorded as a commit authored
+    /// by the session's [`writer`](Session::writer). If version control cannot be
+    /// opened it is simply left disabled (edits still persist to disk), never
+    /// aborting the session.
     fn dispatch_tool_calls(&mut self, tool_calls: Option<Vec<crate::req::ToolCall>>) -> Step {
         let calls = tool_calls.unwrap_or_default();
         if calls.is_empty() {
@@ -500,16 +619,72 @@ impl Session {
             }
         }
 
+        // Open the version-control handle once, at the same root, alongside the
+        // workspace. A failure here is non-fatal: edits still write to disk
+        // through the workspace, they just are not committed (and the history /
+        // diff / undo tools then report version control as disabled). This keeps
+        // the "guard rails in the tools, recovery in the model" contract — a
+        // missing git repository never aborts a writing session.
+        if self.vcs.is_none()
+            && let Some(ws) = self.workspace.as_ref()
+            && let Ok(vcs) = Vcs::open_or_init(ws.root())
+        {
+            self.vcs = Some(vcs);
+        }
+
         let mut names = Vec::with_capacity(calls.len());
         for call in &calls {
             names.push(call.function.name.clone());
-            let payload = {
+
+            // Announce the call before dispatching, with its arguments as parsed
+            // JSON (or `null` when empty / unparseable) for the UI.
+            let name = call.function.name.clone();
+            let args = parse_tool_args(&call.function.arguments);
+            self.events.emit(Event::ToolCalled {
+                name: name.clone(),
+                args,
+            });
+
+            let writer = self.writer.clone();
+            let result = {
+                // Borrow the two workspace handles disjointly (different fields).
                 let ws = self.workspace.as_mut().expect("workspace opened above");
-                let mut ctx = ToolCtx::new(ws, self.writer.clone());
-                match self.tools.dispatch(&call.function, &mut ctx) {
-                    Ok(value) => value,
-                    Err(e) => serde_json::json!({ "error": e.to_string() }),
+                let mut ctx = ToolCtx::new(ws, writer.clone());
+                if let Some(vcs) = self.vcs.as_ref() {
+                    ctx = ctx.with_vcs(vcs);
                 }
+                self.tools.dispatch(&call.function, &mut ctx)
+            };
+
+            // Report the outcome, and — when the call recorded a commit — emit a
+            // dedicated `EditCommitted` so the UI can render the version event.
+            match &result {
+                Ok(value) => {
+                    self.events.emit(Event::ToolResult {
+                        name: name.clone(),
+                        ok: true,
+                        summary: summarize_ok(value),
+                    });
+                    if let Some((article, sha)) = committed_edit(value) {
+                        self.events.emit(Event::EditCommitted {
+                            article,
+                            author: writer.provenance_tag(),
+                            sha,
+                        });
+                    }
+                }
+                Err(e) => {
+                    self.events.emit(Event::ToolResult {
+                        name: name.clone(),
+                        ok: false,
+                        summary: e.to_string(),
+                    });
+                }
+            }
+
+            let payload = match result {
+                Ok(value) => value,
+                Err(e) => serde_json::json!({ "error": e.to_string() }),
             };
             self.push_tool_reply(&call.id, &payload);
         }
@@ -523,6 +698,67 @@ impl Session {
         let content = serde_json::to_string(payload).unwrap_or_else(|_| payload.to_string());
         self.history.push(Message::tool(tool_call_id, content));
     }
+}
+
+/// Truncates a system prompt to at most [`SYSTEM_EXCERPT_LEN`] characters for an
+/// [`Event::SessionStarted`] excerpt, appending an ellipsis when it was cut.
+///
+/// Truncation is on `char` boundaries (not bytes), so it never splits a
+/// multi-byte UTF-8 character.
+fn system_excerpt(system: &str) -> String {
+    if system.chars().count() <= SYSTEM_EXCERPT_LEN {
+        return system.to_string();
+    }
+    let head: String = system.chars().take(SYSTEM_EXCERPT_LEN).collect();
+    format!("{head}…")
+}
+
+/// Parses a tool call's JSON-encoded `arguments` string into a
+/// [`serde_json::Value`] for an [`Event::ToolCalled`], mapping empty or
+/// unparseable arguments to [`serde_json::Value::Null`].
+///
+/// This is best-effort and never fails: the event is for display, so malformed
+/// arguments simply surface as `null` rather than aborting emission. The actual
+/// dispatch path does its own strict parsing and reports argument errors back to
+/// the model.
+fn parse_tool_args(arguments: &str) -> serde_json::Value {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::from_str(trimmed).unwrap_or(serde_json::Value::Null)
+}
+
+/// Builds a short, display-oriented summary of a successful tool result for an
+/// [`Event::ToolResult`].
+///
+/// A compact JSON encoding of the result object is used, truncated so a large
+/// payload (e.g. a full article body returned by `read_article`) does not bloat
+/// the event stream.
+fn summarize_ok(value: &serde_json::Value) -> String {
+    /// Maximum characters of a result summary carried in an event.
+    const MAX: usize = 200;
+    let rendered = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    if rendered.chars().count() <= MAX {
+        rendered
+    } else {
+        let head: String = rendered.chars().take(MAX).collect();
+        format!("{head}…")
+    }
+}
+
+/// Extracts the `(article, sha)` pair from a tool result that recorded a commit,
+/// or `None` if the result did not commit anything.
+///
+/// The lock-guarded editors return a payload shaped like
+/// `{"edited": "<theme>/<file>", "committed": "<sha>", …}` when version control
+/// is enabled (and omit `committed` when it is not). This reads those two fields,
+/// returning `None` whenever either is absent — so a read-only tool, or an edit
+/// made with version control disabled, emits no [`Event::EditCommitted`].
+fn committed_edit(value: &serde_json::Value) -> Option<(String, String)> {
+    let article = value.get("edited")?.as_str()?.to_string();
+    let sha = value.get("committed")?.as_str()?.to_string();
+    Some((article, sha))
 }
 
 /// A serializable point-in-time capture of a [`Session`]'s persistent state.
@@ -796,5 +1032,247 @@ mod tests {
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
         assert!(registry.definitions().is_empty());
+    }
+
+    // --- Event emission over a fake (loopback, no live API) session run ---
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    use crate::observe::{Event, EventSink};
+
+    /// An [`EventSink`] that records every event it receives, for asserting the
+    /// emission sequence of a run.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<Event>>);
+
+    impl Recorder {
+        /// The ordered list of event kind labels captured so far.
+        fn kinds(&self) -> Vec<&'static str> {
+            self.0
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .map(event_kind)
+                .collect()
+        }
+    }
+
+    impl EventSink for Recorder {
+        fn emit(&self, event: Event) {
+            self.0.lock().expect("not poisoned").push(event);
+        }
+    }
+
+    /// A stable short kind label for an [`Event`], used only by these tests.
+    fn event_kind(e: &Event) -> &'static str {
+        match e {
+            Event::SessionStarted { .. } => "SessionStarted",
+            Event::RoundStarted { .. } => "RoundStarted",
+            Event::ModelMessage { .. } => "ModelMessage",
+            Event::ToolCalled { .. } => "ToolCalled",
+            Event::ToolResult { .. } => "ToolResult",
+            Event::EditCommitted { .. } => "EditCommitted",
+            Event::SlaveSpawned { .. } => "SlaveSpawned",
+            Event::SlaveReported { .. } => "SlaveReported",
+            Event::Finished { .. } => "Finished",
+        }
+    }
+
+    /// Spawns a one-shot loopback HTTP server that replies to each incoming POST
+    /// with the next canned body in `bodies` (200 OK), then returns the bound
+    /// `base_url` to point a [`Client`] at.
+    ///
+    /// This is a fake, not the live DeepSeek API: it serves fixed JSON over
+    /// `127.0.0.1`, so a full [`Session::run_round`] can be exercised with zero
+    /// network egress. The server thread handles exactly `bodies.len()` requests
+    /// and then exits.
+    fn spawn_fake_api(bodies: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().expect("accept");
+                // Drain the request: read headers, then the Content-Length body.
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).expect("read request");
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&data);
+                    if let Some(headers_end) = text.find("\r\n\r\n") {
+                        let header_block = &text[..headers_end];
+                        let content_len = header_block
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.to_ascii_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        let body_so_far = data.len() - (headers_end + 4);
+                        if body_so_far >= content_len {
+                            break;
+                        }
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.as_bytes().len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).expect("write resp");
+                stream.flush().ok();
+            }
+        });
+        base
+    }
+
+    /// A canned tool-calls response invoking the `echo` tool once.
+    fn tool_call_response() -> String {
+        serde_json::json!({
+            "id": "resp-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "calling echo",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "echo", "arguments": "{\"text\":\"hi\"}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8,
+                "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 5
+            }
+        })
+        .to_string()
+    }
+
+    /// A canned final `stop` response.
+    fn stop_response() -> String {
+        serde_json::json!({
+            "id": "resp-2",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "all done" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 6, "completion_tokens": 2, "total_tokens": 8,
+                "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 6
+            }
+        })
+        .to_string()
+    }
+
+    fn fake_client(base_url: String) -> Client {
+        Client::builder()
+            .api_key("test-key")
+            .base_url(base_url)
+            .build()
+            .expect("fake client")
+    }
+
+    #[test]
+    fn run_emits_full_event_sequence_over_a_fake_round() {
+        // Two rounds: the model calls `echo` (round 1), then stops (round 2).
+        let base = spawn_fake_api(vec![tool_call_response(), stop_response()]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let mut session = Session::new(
+            fake_client(base),
+            "You are a careful writing assistant.",
+            registry,
+            SessionOptions::default(),
+        );
+        let recorder: Arc<Recorder> = Arc::new(Recorder::default());
+        let sink: Arc<dyn EventSink> = Arc::clone(&recorder) as Arc<dyn EventSink>;
+        session.set_event_sink("slave", sink);
+        session.push_user("do the thing");
+
+        let terminal = session.run_until_done();
+        assert!(matches!(terminal, Step::Done(_)), "run should finish Done");
+
+        // The session-start event fires once, the round/tool events bracket the
+        // echo call, and the run finishes — in this exact order.
+        assert_eq!(
+            recorder.kinds(),
+            [
+                "SessionStarted", // first round only
+                "RoundStarted",   // round 1
+                "ModelMessage",   // "calling echo"
+                "ToolCalled",     // echo
+                "ToolResult",     // echo ok
+                "RoundStarted",   // round 2
+                "ModelMessage",   // "all done"
+                "Finished",       // Done
+            ]
+        );
+
+        // Spot-check the payloads of the structured events.
+        let events = recorder.0.lock().expect("not poisoned");
+        match &events[0] {
+            Event::SessionStarted {
+                role,
+                system_excerpt,
+            } => {
+                assert_eq!(role, "slave");
+                assert!(system_excerpt.starts_with("You are a careful"));
+            }
+            other => panic!("expected SessionStarted, got {other:?}"),
+        }
+        match &events[3] {
+            Event::ToolCalled { name, args } => {
+                assert_eq!(name, "echo");
+                assert_eq!(args["text"], "hi");
+            }
+            other => panic!("expected ToolCalled, got {other:?}"),
+        }
+        match &events[4] {
+            Event::ToolResult { name, ok, .. } => {
+                assert_eq!(name, "echo");
+                assert!(ok);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        match &events[7] {
+            Event::Finished { outcome } => assert_eq!(outcome, "done"),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_sink_is_silent_and_changes_no_behaviour() {
+        // Without a sink installed (the default NullSink), a full run still
+        // completes exactly as before; observability is transparent.
+        let base = spawn_fake_api(vec![stop_response()]);
+        let mut session = Session::new(
+            fake_client(base),
+            "sys",
+            ToolRegistry::new(),
+            SessionOptions::default(),
+        );
+        session.push_user("hello");
+        let terminal = session.run_round();
+        match terminal {
+            Step::Done(text) => assert_eq!(text, "all done"),
+            other => panic!("expected Done, got {other:?}"),
+        }
     }
 }

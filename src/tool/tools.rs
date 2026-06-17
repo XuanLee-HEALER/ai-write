@@ -18,7 +18,14 @@
 //! | [`EditArticle`] | ✅ | exact unique `old` → `new` replace |
 //! | [`ApplyEdits`] | ✅ | fine-grained, atomic batch of offset/anchor ops |
 //! | [`AcquireLock`] / [`ReleaseLock`] | — | single-writer article lock |
+//! | [`ArticleHistory`] / [`ArticleDiff`] | — | git version history / unified diff |
+//! | [`UndoLast`] | ✅ | article-level undo (restore + re-commit) |
 //! | [`Report`] | — | slave → master structured report |
+//!
+//! The [`ArticleHistory`] / [`ArticleDiff`] / [`UndoLast`] tools are backed by
+//! the [`vcs`](crate::vcs) module and require a [`Vcs`](crate::vcs::Vcs) attached
+//! to the [`ToolCtx`] (the [`session`](crate::session) layer attaches one); they
+//! return [`ToolError::Vcs`] when version control is not enabled.
 //!
 //! [`ToolCtx`]: crate::tool::ToolCtx
 //! [`ToolError`]: crate::tool::ToolError
@@ -50,6 +57,24 @@ fn string_prop(description: &str) -> Value {
     json!({ "type": "string", "description": description })
 }
 
+/// Builds the success payload for a lock-guarded editor, folding in `extra`
+/// fields and the commit SHA when version control recorded one.
+///
+/// The `edited` field always names the article; `committed` carries the short
+/// SHA when a [`Vcs`](crate::vcs::Vcs) was attached and the edit was committed,
+/// and is absent (rather than `null`) when version control is disabled — so a
+/// model running without a repository sees a clean, commit-free result.
+fn commit_result(theme: &str, file_name: &str, sha: Option<String>, extra: Value) -> Value {
+    let mut out = json!({ "edited": format!("{theme}/{file_name}") });
+    if let (Some(map), Value::Object(extra)) = (out.as_object_mut(), extra) {
+        map.extend(extra);
+        if let Some(sha) = sha {
+            map.insert("committed".to_string(), Value::String(sha));
+        }
+    }
+    out
+}
+
 /// Registers all v0 native writing tools (everything except search) into a fresh
 /// [`ToolRegistry`](crate::tool::ToolRegistry).
 ///
@@ -61,7 +86,7 @@ fn string_prop(description: &str) -> Value {
 /// use ai_write::tool::tools::writing_tools;
 ///
 /// let registry = writing_tools();
-/// assert!(registry.len() >= 12);
+/// assert!(registry.len() >= 15);
 /// ```
 pub fn writing_tools() -> crate::tool::ToolRegistry {
     let mut r = crate::tool::ToolRegistry::new();
@@ -77,6 +102,9 @@ pub fn writing_tools() -> crate::tool::ToolRegistry {
         .register(Box::new(ApplyEdits))
         .register(Box::new(AcquireLock))
         .register(Box::new(ReleaseLock))
+        .register(Box::new(ArticleHistory))
+        .register(Box::new(ArticleDiff))
+        .register(Box::new(UndoLast))
         .register(Box::new(Report));
     r
 }
@@ -431,7 +459,19 @@ impl Tool for WriteArticle {
         let writer = ctx.writer.clone();
         ctx.ws
             .write_article(&a.theme, &a.file_name, &a.text, &writer)?;
-        Ok(json!({ "written": format!("{}/{}", a.theme, a.file_name), "bytes": a.text.len() }))
+        let message = format!(
+            "edit({}/{}): write_article ({} bytes)",
+            a.theme,
+            a.file_name,
+            a.text.len()
+        );
+        let sha = ctx.commit_article(&a.theme, &a.file_name, &message)?;
+        Ok(commit_result(
+            &a.theme,
+            &a.file_name,
+            sha,
+            json!({ "bytes": a.text.len() }),
+        ))
     }
 }
 
@@ -500,7 +540,12 @@ impl Tool for EditArticle {
         let updated = current.replacen(&a.old, &a.new, 1);
         ctx.ws
             .write_article(&a.theme, &a.file_name, &updated, &writer)?;
-        Ok(json!({ "edited": format!("{}/{}", a.theme, a.file_name) }))
+        let message = format!(
+            "edit({}/{}): edit_article (1 replacement)",
+            a.theme, a.file_name
+        );
+        let sha = ctx.commit_article(&a.theme, &a.file_name, &message)?;
+        Ok(commit_result(&a.theme, &a.file_name, sha, json!({})))
     }
 }
 
@@ -791,12 +836,18 @@ impl Tool for ApplyEdits {
 
     fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
         let a: ApplyEditsArgs = parse_args(args)?;
+        let op_count = a.edits.len();
         let writer = ctx.writer.clone();
         let current = ctx.ws.read_article(&a.theme, &a.file_name)?;
         let updated = apply_edits_atomic(&current, a.edits)?;
         ctx.ws
             .write_article(&a.theme, &a.file_name, &updated, &writer)?;
-        Ok(json!({ "edited": format!("{}/{}", a.theme, a.file_name) }))
+        let message = format!(
+            "edit({}/{}): apply_edits {} ops",
+            a.theme, a.file_name, op_count
+        );
+        let sha = ctx.commit_article(&a.theme, &a.file_name, &message)?;
+        Ok(commit_result(&a.theme, &a.file_name, sha, json!({})))
     }
 }
 
@@ -864,6 +915,158 @@ impl Tool for ReleaseLock {
         let writer = ctx.writer.clone();
         ctx.ws.release_lock(&a.theme, &a.file_name, &writer)?;
         Ok(json!({ "released": format!("{}/{}", a.theme, a.file_name) }))
+    }
+}
+
+// ===========================================================================
+// Version control (history / diff / undo)
+// ===========================================================================
+
+/// Resolves the article's workspace-relative path (`<theme>/<file_name>`) for a
+/// version-control tool, or [`ToolError::Vcs`] when no [`Vcs`](crate::vcs::Vcs)
+/// is attached to the context.
+fn require_vcs<'a>(ctx: &'a ToolCtx<'_>) -> Result<&'a crate::vcs::Vcs, ToolError> {
+    ctx.vcs.ok_or_else(|| {
+        ToolError::Vcs("version control is not enabled for this workspace".to_string())
+    })
+}
+
+/// Lists an article's commit history (newest first), backed by libgit2.
+pub struct ArticleHistory;
+
+impl Tool for ArticleHistory {
+    fn name(&self) -> &str {
+        "article_history"
+    }
+
+    fn schema(&self) -> ReqTool {
+        def(
+            "article_history",
+            "List the version history of an article, newest first. Each entry has \
+             a short commit id, the author (the writer who made the edit), the \
+             commit message, and a Unix timestamp. Use the ids with `article_diff` \
+             or to understand how the article evolved.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "theme": string_prop("The theme the article belongs to."),
+                    "file_name": string_prop("The article file name."),
+                },
+                "required": ["theme", "file_name"],
+            }),
+        )
+    }
+
+    fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
+        let a: ArticleRef = parse_args(args)?;
+        let vcs = require_vcs(ctx)?;
+        let rel = std::path::Path::new(&a.theme).join(&a.file_name);
+        let history = vcs
+            .history(&rel)
+            .map_err(|e| ToolError::Vcs(e.to_string()))?;
+        Ok(json!({ "history": history }))
+    }
+}
+
+/// Renders a unified diff of an article between two versions, backed by libgit2.
+pub struct ArticleDiff;
+
+#[derive(Deserialize)]
+struct ArticleDiffArgs {
+    theme: String,
+    file_name: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+}
+
+impl Tool for ArticleDiff {
+    fn name(&self) -> &str {
+        "article_diff"
+    }
+
+    fn schema(&self) -> ReqTool {
+        def(
+            "article_diff",
+            "Show a unified diff of an article between two versions. `from` and \
+             `to` are commit ids (from `article_history`), or `HEAD`, `HEAD~1`, … \
+             Omit `from` to diff against the empty file (the full content as \
+             additions); omit `to` to diff a committed version against the current \
+             working file. An empty result means no change between the two.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "theme": string_prop("The theme the article belongs to."),
+                    "file_name": string_prop("The article file name."),
+                    "from": string_prop("The base revision (commit id / HEAD~n). Optional."),
+                    "to": string_prop("The target revision (commit id / HEAD). Optional; defaults to the working file."),
+                },
+                "required": ["theme", "file_name"],
+            }),
+        )
+    }
+
+    fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
+        let a: ArticleDiffArgs = parse_args(args)?;
+        let vcs = require_vcs(ctx)?;
+        let rel = std::path::Path::new(&a.theme).join(&a.file_name);
+        let patch = vcs
+            .diff(&rel, a.from.as_deref(), a.to.as_deref())
+            .map_err(|e| ToolError::Vcs(e.to_string()))?;
+        Ok(json!({ "diff": patch }))
+    }
+}
+
+/// Reverts an article to its previous committed version, recording the revert as
+/// a new commit (article-level undo).
+pub struct UndoLast;
+
+impl Tool for UndoLast {
+    fn name(&self) -> &str {
+        "undo_last"
+    }
+
+    fn schema(&self) -> ReqTool {
+        def(
+            "undo_last",
+            "Undo the most recent edit to an article: restore its previous \
+             committed version and record that restoration as a new commit \
+             (history is preserved, never rewritten). Returns the new commit id, \
+             or reports that there was nothing to undo when the article has only \
+             one version. You must hold the article lock.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "theme": string_prop("The theme the article belongs to."),
+                    "file_name": string_prop("The article file name to undo."),
+                },
+                "required": ["theme", "file_name"],
+            }),
+        )
+    }
+
+    fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
+        let a: ArticleRef = parse_args(args)?;
+        let writer = ctx.writer.clone();
+        // Undo writes to the article file, so honour the single-writer lock just
+        // like the other editors.
+        ctx.ws.ensure_lock_held(&a.theme, &a.file_name, &writer)?;
+        let vcs = require_vcs(ctx)?;
+        let rel = std::path::Path::new(&a.theme).join(&a.file_name);
+        let reverted = vcs
+            .undo_last(&rel, &writer)
+            .map_err(|e| ToolError::Vcs(e.to_string()))?;
+        match reverted {
+            Some(sha) => Ok(json!({
+                "undone": format!("{}/{}", a.theme, a.file_name),
+                "committed": sha,
+            })),
+            None => Ok(json!({
+                "undone": false,
+                "reason": "nothing to undo (article has only one version)",
+            })),
+        }
     }
 }
 
@@ -987,11 +1190,14 @@ mod tests {
             "apply_edits",
             "acquire_lock",
             "release_lock",
+            "article_history",
+            "article_diff",
+            "undo_last",
             "report",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(r.len(), 13);
+        assert_eq!(r.len(), 16);
     }
 
     #[test]
@@ -1398,5 +1604,269 @@ mod tests {
 
         let err = call(&mut ws, &CreateTheme, json!({ "theme": "../evil" })).unwrap_err();
         assert!(matches!(err, ToolError::SandboxViolation(_)));
+    }
+
+    // ----- vcs integration: edits commit, history/diff/undo -----------------
+
+    use crate::vcs::Vcs;
+
+    /// Sets up a workspace **and** a [`Vcs`] over the same temp-dir root, with one
+    /// theme and one locked article ready to edit. Returns the temp dir (kept
+    /// alive), the workspace, and the vcs handle.
+    fn vcs_fixture() -> (tempfile::TempDir, Workspace, Vcs) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ws = Workspace::open(dir.path()).expect("open");
+        let vcs = Vcs::open_or_init(ws.root()).expect("open_or_init");
+        ws.create_theme("t").unwrap();
+        ws.create_article("t", "a.md", "A", None).unwrap();
+        ws.acquire_lock("t", "a.md", &agent()).unwrap();
+        (dir, ws, vcs)
+    }
+
+    /// Dispatches one tool call against a context carrying a [`Vcs`].
+    fn call_vcs(ws: &mut Workspace, vcs: &Vcs, tool: &dyn Tool, args: Value) -> ToolResult {
+        let mut ctx = ToolCtx::new(ws, agent()).with_vcs(vcs);
+        tool.call(args, &mut ctx)
+    }
+
+    #[test]
+    fn write_article_produces_one_commit_with_the_right_author() {
+        let (_d, mut ws, vcs) = vcs_fixture();
+        let out = call_vcs(
+            &mut ws,
+            &vcs,
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "first draft" }),
+        )
+        .unwrap();
+        // The result advertises the commit it produced.
+        let sha = out["committed"].as_str().expect("committed sha");
+        assert_eq!(sha.len(), 10);
+
+        // Exactly one commit touched the article, authored by the agent identity.
+        let hist = vcs.history(std::path::Path::new("t/a.md")).unwrap();
+        assert_eq!(hist.len(), 1, "one edit must be one commit");
+        assert_eq!(hist[0].id, sha);
+        assert_eq!(hist[0].author, "deepseek-v4-pro/s1 <agent@ai-write.local>");
+        assert!(hist[0].message.contains("write_article"));
+    }
+
+    #[test]
+    fn index_json_is_committed_alongside_the_article() {
+        let (_d, mut ws, vcs) = vcs_fixture();
+        call_vcs(
+            &mut ws,
+            &vcs,
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "body" }),
+        )
+        .unwrap();
+        // The theme index (which records the new contributor) is versioned too,
+        // as its own separate commit.
+        let index_hist = vcs.history(std::path::Path::new("t/index.json")).unwrap();
+        assert_eq!(index_hist.len(), 1, "index.json must be committed");
+        assert!(index_hist[0].message.contains("index(t)"));
+    }
+
+    #[test]
+    fn apply_edits_message_records_op_count() {
+        let (_d, mut ws, vcs) = vcs_fixture();
+        // Seed initial content (commit 1).
+        call_vcs(
+            &mut ws,
+            &vcs,
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "alpha beta gamma" }),
+        )
+        .unwrap();
+        // Two-op batch (commit 2).
+        call_vcs(
+            &mut ws,
+            &vcs,
+            &ApplyEdits,
+            json!({
+                "theme": "t", "file_name": "a.md",
+                "edits": [
+                    { "op": "replace_text", "anchor": "alpha", "text": "A" },
+                    { "op": "replace_text", "anchor": "gamma", "text": "G" }
+                ]
+            }),
+        )
+        .unwrap();
+        let hist = vcs.history(std::path::Path::new("t/a.md")).unwrap();
+        assert_eq!(hist.len(), 2);
+        assert!(
+            hist[0].message.contains("apply_edits 2 ops"),
+            "message was: {}",
+            hist[0].message
+        );
+        assert_eq!(ws.read_article("t", "a.md").unwrap(), "A beta G");
+    }
+
+    #[test]
+    fn edits_without_vcs_skip_commit_but_still_write() {
+        // The no-vcs `call` helper omits the Vcs, so the result has no `committed`
+        // field and the edit still lands on disk (v0 behaviour preserved).
+        let (_d, mut ws) = fixture();
+        ws.acquire_lock("t", "a.md", &agent()).unwrap();
+        let out = call(
+            &mut ws,
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "no git here" }),
+        )
+        .unwrap();
+        assert!(out.get("committed").is_none());
+        assert_eq!(ws.read_article("t", "a.md").unwrap(), "no git here");
+    }
+
+    #[test]
+    fn article_history_tool_lists_commits_newest_first() {
+        let (_d, mut ws, vcs) = vcs_fixture();
+        for text in ["v1", "v2", "v3"] {
+            call_vcs(
+                &mut ws,
+                &vcs,
+                &WriteArticle,
+                json!({ "theme": "t", "file_name": "a.md", "text": text }),
+            )
+            .unwrap();
+        }
+        let out = call_vcs(
+            &mut ws,
+            &vcs,
+            &ArticleHistory,
+            json!({ "theme": "t", "file_name": "a.md" }),
+        )
+        .unwrap();
+        let entries = out["history"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        // Newest first; the most recent commit message mentions write_article.
+        assert!(
+            entries[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("write_article")
+        );
+    }
+
+    #[test]
+    fn article_diff_tool_shows_change_between_versions() {
+        let (_d, mut ws, vcs) = vcs_fixture();
+        call_vcs(
+            &mut ws,
+            &vcs,
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "line one\n" }),
+        )
+        .unwrap();
+        call_vcs(
+            &mut ws,
+            &vcs,
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "line two\n" }),
+        )
+        .unwrap();
+        // Diff between the two article commits, located via history (each edit
+        // also produces an index commit, so HEAD~1 is not the prior *article*
+        // version — use the real commit ids instead).
+        let hist = vcs.history(std::path::Path::new("t/a.md")).unwrap();
+        let (newest, prior) = (&hist[0].id, &hist[1].id);
+        let out = call_vcs(
+            &mut ws,
+            &vcs,
+            &ArticleDiff,
+            json!({ "theme": "t", "file_name": "a.md", "from": prior, "to": newest }),
+        )
+        .unwrap();
+        let patch = out["diff"].as_str().unwrap();
+        assert!(patch.contains("-line one"), "patch: {patch}");
+        assert!(patch.contains("+line two"), "patch: {patch}");
+    }
+
+    #[test]
+    fn undo_last_tool_reverts_to_previous_version() {
+        let (_d, mut ws, vcs) = vcs_fixture();
+        call_vcs(
+            &mut ws,
+            &vcs,
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "original\n" }),
+        )
+        .unwrap();
+        call_vcs(
+            &mut ws,
+            &vcs,
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "changed\n" }),
+        )
+        .unwrap();
+        assert_eq!(ws.read_article("t", "a.md").unwrap(), "changed\n");
+
+        let out = call_vcs(
+            &mut ws,
+            &vcs,
+            &UndoLast,
+            json!({ "theme": "t", "file_name": "a.md" }),
+        )
+        .unwrap();
+        assert!(out["committed"].is_string());
+        // Content reverted on disk; history grew (revert is itself a commit).
+        assert_eq!(ws.read_article("t", "a.md").unwrap(), "original\n");
+        let hist = vcs.history(std::path::Path::new("t/a.md")).unwrap();
+        assert_eq!(hist.len(), 3, "undo restores then re-commits");
+    }
+
+    #[test]
+    fn undo_last_tool_requires_lock() {
+        let (_d, mut ws, vcs) = vcs_fixture();
+        call_vcs(
+            &mut ws,
+            &vcs,
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "x\n" }),
+        )
+        .unwrap();
+        ws.release_lock("t", "a.md", &agent()).unwrap();
+        let err = call_vcs(
+            &mut ws,
+            &vcs,
+            &UndoLast,
+            json!({ "theme": "t", "file_name": "a.md" }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Lock(_)));
+    }
+
+    #[test]
+    fn undo_last_tool_with_single_version_reports_nothing_to_undo() {
+        let (_d, mut ws, vcs) = vcs_fixture();
+        call_vcs(
+            &mut ws,
+            &vcs,
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "only\n" }),
+        )
+        .unwrap();
+        let out = call_vcs(
+            &mut ws,
+            &vcs,
+            &UndoLast,
+            json!({ "theme": "t", "file_name": "a.md" }),
+        )
+        .unwrap();
+        assert_eq!(out["undone"], json!(false));
+    }
+
+    #[test]
+    fn history_tools_error_when_vcs_disabled() {
+        // Without a Vcs attached, the version-control tools surface ToolError::Vcs.
+        let (_d, mut ws) = fixture();
+        let err = call(
+            &mut ws,
+            &ArticleHistory,
+            json!({ "theme": "t", "file_name": "a.md" }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Vcs(_)));
     }
 }

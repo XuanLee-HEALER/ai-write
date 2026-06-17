@@ -32,10 +32,12 @@
 //! the run), the engine synthesizes a report from the [terminal step](Step)
 //! instead, so the master always receives a structured outcome.
 
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use serde::{Deserialize, Serialize};
 
+use crate::observe::{Event, EventSink, NullSink};
 use crate::req::Message;
 use crate::req::blocking::Client;
 use crate::req::types::request::Role;
@@ -263,12 +265,20 @@ fn run_slave_session(mut session: Session, task: &SlaveTask) -> SlaveReport {
 }
 
 /// Builds the writing-configured slave [`Session`] for `task`, rooted at
-/// `workspace_root`.
+/// `workspace_root`, narrating to `events`.
 ///
 /// The session is given the full [`writing_tools`] registry, the slave system
 /// prompt, and the task's [`WriterId`] so its tool calls are dispatched under
-/// the slave's agent identity against the workspace it owns.
-fn build_slave_session(client: Client, workspace_root: &str, task: &SlaveTask) -> Session {
+/// the slave's agent identity against the workspace it owns. The `events` sink is
+/// installed under the `"slave"` role so the slave's per-round / per-tool /
+/// per-commit [`Event`]s flow into the same feed as the master's slave-lifecycle
+/// events.
+fn build_slave_session(
+    client: Client,
+    workspace_root: &str,
+    task: &SlaveTask,
+    events: Arc<dyn EventSink>,
+) -> Session {
     let mut session = Session::new(
         client,
         SLAVE_SYSTEM_PROMPT,
@@ -276,6 +286,7 @@ fn build_slave_session(client: Client, workspace_root: &str, task: &SlaveTask) -
         SessionOptions::default(),
     );
     session.set_workspace(workspace_root, task.writer.clone());
+    session.set_event_sink("slave", events);
     session
 }
 
@@ -324,10 +335,72 @@ pub fn spawn_slave(
     workspace_root: String,
     task: SlaveTask,
 ) -> JoinHandle<SlaveReport> {
+    spawn_slave_with_sink(client, workspace_root, task, Arc::new(NullSink))
+}
+
+/// Spawns a slave on its own [`std::thread`], narrating its lifecycle and inner
+/// steps to `events`.
+///
+/// This is the observable form of [`spawn_slave`]: it emits an
+/// [`Event::SlaveSpawned`] as the thread starts and an [`Event::SlaveReported`]
+/// once the slave's [`SlaveReport`] is distilled, and installs `events` on the
+/// slave's [`Session`] so its per-round / per-tool / per-commit events flow into
+/// the same feed. Both lifecycle events are emitted **on the slave thread**, so
+/// they bracket the run regardless of when the caller joins the handle.
+/// [`spawn_slave`] is the plain wrapper that passes a [`NullSink`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use ai_write::engine::{spawn_slave_with_sink, SlaveTask};
+/// use ai_write::observe::NullSink;
+/// use ai_write::tool::workspace::WriterId;
+/// use ai_write::req::blocking::Client;
+///
+/// let client = Client::from_env()?;
+/// let task = SlaveTask {
+///     theme: "rust".into(),
+///     file_name: "intro.md".into(),
+///     task: "Write a short introduction to ownership.".into(),
+///     writer: WriterId::Agent { model: "deepseek-v4-pro".into(), label: "s1".into() },
+/// };
+/// let handle = spawn_slave_with_sink(client, "workspace".into(), task, Arc::new(NullSink));
+/// let report = handle.join().expect("slave thread");
+/// println!("{:?}", report.status);
+/// # Ok::<(), ai_write::req::Error>(())
+/// ```
+pub fn spawn_slave_with_sink(
+    client: Client,
+    workspace_root: String,
+    task: SlaveTask,
+    events: Arc<dyn EventSink>,
+) -> JoinHandle<SlaveReport> {
     std::thread::spawn(move || {
-        let session = build_slave_session(client, &workspace_root, &task);
-        run_slave_session(session, &task)
+        events.emit(Event::SlaveSpawned {
+            theme: task.theme.clone(),
+            file: task.file_name.clone(),
+            writer: task.writer.provenance_tag(),
+        });
+        let session = build_slave_session(client, &workspace_root, &task, Arc::clone(&events));
+        let report = run_slave_session(session, &task);
+        events.emit(Event::SlaveReported {
+            status: report_status_str(&report.status).to_string(),
+            summary: report.summary.clone(),
+        });
+        report
     })
+}
+
+/// Maps a [`SlaveStatus`] to the lowercase string used in an
+/// [`Event::SlaveReported`] (`"done"` / `"needs_human"` / `"failed"`), the
+/// inverse of [`SlaveStatus::from_report_status`].
+fn report_status_str(status: &SlaveStatus) -> &'static str {
+    match status {
+        SlaveStatus::Done => "done",
+        SlaveStatus::NeedsHuman => "needs_human",
+        SlaveStatus::Failed => "failed",
+    }
 }
 
 /// The master: the orchestrating session for one theme.
@@ -411,8 +484,13 @@ impl Master {
 
         // TODO(v0+): supervise the slave (restart / re-dispatch on failure). v0
         // dispatches exactly one slave, joins it, and reports the outcome.
+        //
+        // The slave is given the master's event sink so its lifecycle and inner
+        // steps narrate into the same feed the master (and any UI) observes. With
+        // the default `NullSink` this is transparent.
         let client = self.session.client_clone();
-        let handle = spawn_slave(client, self.workspace_root.clone(), task);
+        let events = self.session.event_sink();
+        let handle = spawn_slave_with_sink(client, self.workspace_root.clone(), task, events);
 
         // A panicked slave thread becomes a `Failed` report rather than an error.
         Ok(handle
@@ -605,5 +683,103 @@ mod tests {
         assert_eq!(r.summary, "boom");
         assert!(r.result.is_none());
         assert!(r.needs.is_none());
+    }
+
+    #[test]
+    fn report_status_str_round_trips_with_from_report_status() {
+        for s in [
+            SlaveStatus::Done,
+            SlaveStatus::NeedsHuman,
+            SlaveStatus::Failed,
+        ] {
+            let raw = report_status_str(&s);
+            assert_eq!(SlaveStatus::from_report_status(raw), Some(s));
+        }
+    }
+
+    #[test]
+    fn spawn_slave_with_sink_emits_lifecycle_events() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Mutex;
+
+        use crate::observe::Event;
+
+        /// Records the kind of every event for sequence assertions.
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<&'static str>>);
+        impl EventSink for Recorder {
+            fn emit(&self, event: Event) {
+                let kind = match event {
+                    Event::SessionStarted { .. } => "SessionStarted",
+                    Event::RoundStarted { .. } => "RoundStarted",
+                    Event::ModelMessage { .. } => "ModelMessage",
+                    Event::ToolCalled { .. } => "ToolCalled",
+                    Event::ToolResult { .. } => "ToolResult",
+                    Event::EditCommitted { .. } => "EditCommitted",
+                    Event::SlaveSpawned { .. } => "SlaveSpawned",
+                    Event::SlaveReported { .. } => "SlaveReported",
+                    Event::Finished { .. } => "Finished",
+                };
+                self.0.lock().expect("not poisoned").push(kind);
+            }
+        }
+
+        // A loopback fake returning a single `stop` response, so the slave's one
+        // round finishes immediately with no live API call.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = serde_json::json!({
+                "id": "r", "object": "chat.completion", "created": 0,
+                "model": "deepseek-v4-flash",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "finished" },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).expect("write");
+        });
+
+        let client = Client::builder()
+            .api_key("test-key")
+            .base_url(base)
+            .build()
+            .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task = SlaveTask {
+            theme: "rust".into(),
+            file_name: "intro.md".into(),
+            task: "write".into(),
+            writer: agent(),
+        };
+
+        let recorder: Arc<Recorder> = Arc::new(Recorder::default());
+        let sink: Arc<dyn EventSink> = Arc::clone(&recorder) as Arc<dyn EventSink>;
+        let handle = spawn_slave_with_sink(
+            client,
+            dir.path().to_string_lossy().into_owned(),
+            task,
+            sink,
+        );
+        let report = handle.join().expect("slave thread");
+        assert_eq!(report.status, SlaveStatus::Done);
+
+        let kinds = recorder.0.lock().expect("not poisoned");
+        // The slave lifecycle brackets the inner session events.
+        assert_eq!(kinds.first(), Some(&"SlaveSpawned"));
+        assert_eq!(kinds.last(), Some(&"SlaveReported"));
+        assert!(kinds.contains(&"SessionStarted"));
+        assert!(kinds.contains(&"Finished"));
     }
 }

@@ -38,6 +38,7 @@ pub mod workspace;
 use serde::{Deserialize, Serialize};
 
 use crate::req::FunctionCall;
+use crate::vcs::Vcs;
 use workspace::{Workspace, WriterId};
 
 /// The result of a tool invocation.
@@ -79,6 +80,11 @@ pub enum ToolError {
     /// No tool with the requested name is registered.
     #[error("unknown tool: {0}")]
     UnknownTool(String),
+    /// A version-control operation (commit / history / diff / undo) failed after
+    /// the edit itself succeeded, or a history/diff/undo tool could not be served.
+    /// The on-disk article is already up to date; only the git side failed.
+    #[error("version control error: {0}")]
+    Vcs(String),
     /// Any other tool-level failure.
     #[error("tool failed: {0}")]
     Other(String),
@@ -87,18 +93,112 @@ pub enum ToolError {
 /// The mutable context handed to a [`Tool`] for the duration of one call.
 ///
 /// It bundles the workspace the tool operates on with the identity of the writer
-/// performing the call, so lock-guarded tools can check and record ownership.
+/// performing the call, so lock-guarded tools can check and record ownership, and
+/// optionally a [`Vcs`] handle so a successful content edit is recorded as a git
+/// commit.
+///
+/// # Version control
+///
+/// The [`vcs`](ToolCtx::vcs) handle is **optional**. When present (the
+/// [`session`](crate::session) layer attaches one rooted at the workspace), the
+/// lock-guarded editors ([`WriteArticle`](tools::WriteArticle),
+/// [`EditArticle`](tools::EditArticle), [`ApplyEdits`](tools::ApplyEdits)) call
+/// [`ToolCtx::commit_article`] after a successful write, turning each edit into a
+/// commit authored by [`writer`](ToolCtx::writer); the history / diff / undo tools
+/// read or mutate through it. When absent (the workspace-only unit tests), the
+/// editors behave exactly as in v0 — they write to disk and skip the commit — so
+/// the tool layer is usable without a git repository.
 pub struct ToolCtx<'a> {
     /// The workspace rooted at the theme directory tree.
     pub ws: &'a mut Workspace,
-    /// The identity of the writer issuing this call (used by lock-guarded tools).
+    /// The identity of the writer issuing this call (used by lock-guarded tools
+    /// and as the git author of any commit produced by the call).
     pub writer: WriterId,
+    /// The workspace's version-control handle, when version control is enabled.
+    /// `None` disables committing (and the history/diff/undo tools error with
+    /// [`ToolError::Vcs`]).
+    pub vcs: Option<&'a Vcs>,
 }
 
 impl<'a> ToolCtx<'a> {
-    /// Creates a tool context binding a workspace to a writer identity.
+    /// Creates a tool context binding a workspace to a writer identity, with no
+    /// version control attached.
+    ///
+    /// Use [`ToolCtx::with_vcs`] to attach a [`Vcs`] so successful edits are
+    /// committed.
     pub fn new(ws: &'a mut Workspace, writer: WriterId) -> Self {
-        ToolCtx { ws, writer }
+        ToolCtx {
+            ws,
+            writer,
+            vcs: None,
+        }
+    }
+
+    /// Attaches a [`Vcs`] handle to this context, enabling per-edit commits and
+    /// the history / diff / undo tools. Returns the context for chaining.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::path::Path;
+    /// # use ai_write::tool::ToolCtx;
+    /// # use ai_write::tool::workspace::{Workspace, WriterId};
+    /// # use ai_write::vcs::Vcs;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut ws = Workspace::open("workspace")?;
+    /// let vcs = Vcs::open_or_init(Path::new("workspace"))?;
+    /// let ctx = ToolCtx::new(&mut ws, WriterId::Human).with_vcs(&vcs);
+    /// # let _ = ctx;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_vcs(mut self, vcs: &'a Vcs) -> Self {
+        self.vcs = Some(vcs);
+        self
+    }
+
+    /// Commits an article and its theme index to version control after a
+    /// successful edit, attributing the commit to [`writer`](ToolCtx::writer).
+    ///
+    /// This is a no-op (returning `Ok(())`) when no [`Vcs`] is attached, so the
+    /// lock-guarded editors can call it unconditionally. When a `Vcs` is present
+    /// it produces **two** commits — one for the article file
+    /// (`<theme>/<file_name>`), then one for the theme index
+    /// (`<theme>/index.json`) — matching the version-control module's "one call,
+    /// one commit" granularity and ensuring the reading-order / provenance index
+    /// stays versioned alongside the content. The index commit is skipped when the
+    /// theme has no `index.json` on disk yet.
+    ///
+    /// The edit has already been written to disk by the time this is called, so a
+    /// version-control failure does not lose content; it is surfaced as
+    /// [`ToolError::Vcs`] so the model can see that the commit did not land.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Vcs`] if staging or committing the article (or the
+    /// index) fails.
+    pub fn commit_article(
+        &self,
+        theme: &str,
+        file_name: &str,
+        message: &str,
+    ) -> Result<Option<String>, ToolError> {
+        let Some(vcs) = self.vcs else {
+            return Ok(None);
+        };
+        let article_rel = std::path::Path::new(theme).join(file_name);
+        let sha = vcs
+            .commit_file(&article_rel, &self.writer, message)
+            .map_err(|e| ToolError::Vcs(e.to_string()))?;
+
+        // Version the theme index too, as its own commit, when it exists on disk.
+        let index_rel = std::path::Path::new(theme).join("index.json");
+        if self.ws.root().join(&index_rel).exists() {
+            let index_msg = format!("index({theme}): record edit to {file_name}");
+            vcs.commit_file(&index_rel, &self.writer, &index_msg)
+                .map_err(|e| ToolError::Vcs(e.to_string()))?;
+        }
+        Ok(Some(sha))
     }
 }
 

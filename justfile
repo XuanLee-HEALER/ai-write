@@ -50,3 +50,8 @@ test-live:
 # 用法:just demo "<主题>" "<写作任务>"
 demo theme task:
     set -a; . ./.env; set +a; cargo run --bin demo -- "{{theme}}" "{{task}}"
+
+# 展示用 WebUI(读 .env 的 DEEPSEEK_API_KEY):axum + SSE 服务,浏览器看 AI 写作过程
+# 默认监听 127.0.0.1:8080,工作区 ./workspace(可用 AI_WRITE_BIND / AI_WRITE_WORKSPACE 覆盖)
+webui:
+    set -a; . ./.env; set +a; cargo run --bin webui --features webui

@@ -1,0 +1,17 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# macOS
+.DS_Store
+
+# IDE
+/.idea
+/.vscode
+*.iml

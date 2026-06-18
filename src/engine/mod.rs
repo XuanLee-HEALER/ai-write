@@ -32,6 +32,8 @@
 //! the run), the engine synthesizes a report from the [terminal step](Step)
 //! instead, so the master always receives a structured outcome.
 
+pub mod orchestration;
+
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -42,8 +44,11 @@ use crate::req::Message;
 use crate::req::blocking::Client;
 use crate::req::types::request::Role;
 use crate::session::{Session, SessionOptions, Step};
+use crate::tool::ToolRegistry;
 use crate::tool::tools::writing_tools;
 use crate::tool::workspace::{Workspace, WriterId};
+
+use orchestration::OrchestratorState;
 
 /// The system prompt a slave session is configured with.
 ///
@@ -70,6 +75,40 @@ Rules you must follow:
   describe what you need in `needs`.
 
 Always finish by calling `report` exactly once.";
+
+/// The system prompt the master's orchestration session is configured with.
+///
+/// It frames the master as a *planner and delegator*: it never writes article
+/// prose itself, it sets up structure (themes / articles) and dispatches one
+/// writer per article, reviews the structured reports, and stops when the goal is
+/// met. It deliberately mirrors the slave prompt's discipline (finish cleanly,
+/// adapt to tool errors) at the orchestration altitude.
+const MASTER_SYSTEM_PROMPT: &str = "\
+You are an orchestrator that turns a high-level writing goal into a finished set \
+of articles by planning and delegating. You do NOT write article prose yourself.
+
+Your tools:
+- `create_theme` — create the theme directory the articles live in.
+- `create_article` — create one empty article file inside a theme.
+- `list_articles` — see which article files already exist in a theme.
+- `dispatch_writer` — spawn a writing agent to research, write, and revise ONE \
+  article, then report back. It blocks and returns the writer's structured report.
+- `list_reports` — review every writer's report collected so far.
+
+How to work:
+1. Decide on a theme and the set of articles the goal needs (it may be one \
+   article, or several). Keep the plan focused; do not invent unrelated articles.
+2. Create the theme, then create each planned article file.
+3. Dispatch exactly one writer per article, giving each a clear, self-contained \
+   task. Read each report as it comes back.
+4. If a writer reports `needs_human` or `failed`, note it; do not loop forever \
+   re-dispatching the same article.
+5. When every planned article has a writer report, finish with a short final \
+   message summarizing what was produced. Do not keep calling tools once the \
+   goal is met.
+
+Stay within the workspace and the tools provided. If a tool returns an error, \
+read it and adapt rather than repeating the same call.";
 
 /// The outcome status a slave reports back to its master.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,16 +442,25 @@ fn report_status_str(status: &SlaveStatus) -> &'static str {
     }
 }
 
-/// The master: the orchestrating session for one theme.
+/// The master: the orchestrating session for one writing goal.
 ///
-/// Wraps a [`Session`] (the orchestration tool set +
-/// supervision prompt) together with the [`Workspace`] it manages. In v0 it
-/// creates a theme, spawns a slave, and collects the slave's [`SlaveReport`].
+/// Wraps a [`Session`] together with the [`Workspace`] it manages. It offers two
+/// entry points at different altitudes:
 ///
-/// The master's own [`Session`] is held for forward compatibility (later stages
-/// drive the orchestration through the model); the v0 [`Master::run_one`] flow
-/// is deterministic Rust and uses the session only to share the master's
-/// [`Client`] with the spawned slave.
+/// - [`Master::run_one`] — the **deterministic** v0 flow: ensure a theme and one
+///   article exist, dispatch a single slave for a given [`SlaveTask`], and return
+///   its [`SlaveReport`]. No master-side chat completion happens; the session is
+///   used only to share the master's [`Client`] and [`EventSink`] with the slave.
+/// - [`Master::run_goal`] — the **LLM-driven** v2 flow: the master is reconfigured
+///   as a planning session with the [`orchestration`] tool set
+///   (`create_theme` / `create_article` / `list_articles` / `dispatch_writer` /
+///   `list_reports`) and an orchestrator system prompt, then run to completion so
+///   the model itself plans the article set, dispatches one writer per article,
+///   reviews the structured reports, and decides when the goal is met.
+///
+/// Both flows share the same slave machinery ([`spawn_slave_with_sink`]) and the
+/// same observability feed, so a UI sees a master's tool calls and every slave's
+/// lifecycle in one stream regardless of which entry point was used.
 pub struct Master {
     /// The orchestrating session.
     session: Session,
@@ -498,18 +546,175 @@ impl Master {
             .unwrap_or_else(|_| SlaveReport::failed("Slave thread panicked.")))
     }
 
+    /// Runs the LLM-driven orchestration for a high-level `goal`.
+    ///
+    /// The master is (re)configured as a planning [`Session`]: it is given the
+    /// [`orchestration`] tool set (`create_theme` / `create_article` /
+    /// `list_articles` / `dispatch_writer` / `list_reports`) and the orchestrator
+    /// system prompt, `goal` is pushed as the first user turn, and
+    /// [`Session::run_until_done`] drives the model. The model itself plans the
+    /// article set, creates the structure, dispatches one writer per article
+    /// (each a real slave thread via [`spawn_slave_with_sink`]), reviews the
+    /// structured [`SlaveReport`]s, and finishes when the goal is met.
+    ///
+    /// The session reuses the master's [`Client`] and [`EventSink`] and runs with
+    /// `options` (the model, round budget, and retry policy for the *master's* own
+    /// rounds). Dispatched slaves run with [`SessionOptions::default`]; `slave_model`
+    /// selects the model identity slaves write under (recorded in each article's
+    /// contributor provenance). The returned [`GoalOutcome`] bundles the run's
+    /// terminal [`Step`] outcome label, the master's final assistant message, and
+    /// every [`SlaveReport`] the model collected. After it returns, [`Master::usage`]
+    /// reflects the master's orchestration token usage.
+    ///
+    /// # Errors
+    ///
+    /// Fatal [`req`](crate::req) errors (e.g. an unrecoverable API failure during a
+    /// master round) are returned as `Err`. A slave that fails is **not** an error:
+    /// its failure is carried inside its [`SlaveReport`] in the returned outcome,
+    /// for the model — and the caller — to react to. A master run that exhausts its
+    /// round budget yields a `GoalOutcome` with outcome `"need_human"` rather than
+    /// an `Err`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ai_write::engine::Master;
+    /// use ai_write::session::{Session, SessionOptions};
+    /// use ai_write::req::blocking::Client;
+    /// use ai_write::tool::ToolRegistry;
+    /// use ai_write::tool::workspace::Workspace;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Client::from_env()?;
+    /// let ws = Workspace::open("workspace")?;
+    /// // The session passed to `new` only needs to carry the client/sink; `run_goal`
+    /// // reconfigures it with the orchestration tools and prompt.
+    /// let session = Session::new(client, "orchestrator", ToolRegistry::new(), SessionOptions::default());
+    /// let mut master = Master::new(session, ws);
+    /// let outcome = master.run_goal(
+    ///     "Write a two-article beginner guide to Rust ownership.",
+    ///     SessionOptions::default(),
+    ///     "deepseek-v4-pro",
+    /// )?;
+    /// println!("{} ({} reports)", outcome.outcome, outcome.reports.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn run_goal(
+        &mut self,
+        goal: &str,
+        options: SessionOptions,
+        slave_model: &str,
+    ) -> Result<GoalOutcome, crate::req::Error> {
+        // Reuse the master's client and event sink so the orchestration session
+        // drives the same backend and narrates into the same feed.
+        let client = self.session.client_clone();
+        let events = self.session.event_sink();
+
+        // Shared state the dispatch / report tools record into and read from.
+        let state = Arc::new(OrchestratorState::new(
+            client.clone(),
+            self.workspace_root.clone(),
+            Arc::clone(&events),
+            slave_model.to_string(),
+        ));
+
+        // Build the orchestration session: master prompt + orchestration tools,
+        // dispatching workspace tools under a human "master" identity against the
+        // workspace this master governs.
+        let mut session = Session::new(
+            client,
+            MASTER_SYSTEM_PROMPT,
+            orchestration_tools(Arc::clone(&state)),
+            options,
+        );
+        session.set_workspace(self.workspace_root.clone(), WriterId::Human);
+        session.set_event_sink("master", events);
+        session.push_user(goal);
+
+        let terminal = session.run_until_done();
+
+        // Surface a fatal master-round failure as an `Err`; everything else is a
+        // structured outcome the caller (and model) can act on.
+        if let Step::Failed(err) = terminal {
+            // Adopt the session so `usage()` still reflects the partial run.
+            self.session = session;
+            return Err(err);
+        }
+
+        let (outcome, message) = match &terminal {
+            Step::Done(text) => ("done", text.clone()),
+            Step::NeedHuman => ("need_human", String::new()),
+            // `run_until_done` only returns terminal steps; these are unreachable
+            // in practice but keep the match exhaustive without a panic.
+            Step::Tool(_) | Step::Message(_) | Step::Failed(_) => ("need_human", String::new()),
+        };
+
+        let reports = state.reports();
+        // Adopt the orchestration session so `Master::usage` reports the master's
+        // own token usage for this goal.
+        self.session = session;
+        Ok(GoalOutcome {
+            outcome: outcome.to_string(),
+            message,
+            reports,
+        })
+    }
+
     /// Returns the cumulative token usage of the master's orchestration
     /// [`Session`].
     ///
-    /// In v0 the master performs no chat completion (its orchestration is
-    /// deterministic Rust), so these totals are zero. The accessor exists so a
-    /// caller such as the `demo` binary can report the master's observed usage,
-    /// and so later stages that do drive the master through the model can surface
-    /// real totals through the same seam. A slave's own token usage lives in the
+    /// After [`Master::run_one`] these totals are zero: that flow is deterministic
+    /// Rust and performs no master-side chat completion. After [`Master::run_goal`]
+    /// they reflect the master's own planning rounds (the model deciding what to
+    /// create and dispatch). In either case a slave's own token usage lives in the
     /// slave session on its thread and is not folded into the master.
     pub fn usage(&self) -> &crate::session::UsageTotals {
         self.session.usage()
     }
+}
+
+/// Builds the master's orchestration [`ToolRegistry`]: theme / article structure
+/// tools plus the dispatch / report tools backed by shared `state`.
+///
+/// This is the tool set [`Master::run_goal`] configures its planning session
+/// with. The structure tools ([`CreateTheme`](orchestration::CreateTheme) /
+/// [`CreateArticle`](orchestration::CreateArticle) /
+/// [`ListArticles`](orchestration::ListArticles)) operate through the sandboxed
+/// workspace; the delegation tools ([`DispatchWriter`](orchestration::DispatchWriter)
+/// / [`ListReports`](orchestration::ListReports)) share `state` so dispatched
+/// reports accumulate where [`Master::run_goal`] can read them back.
+fn orchestration_tools(state: Arc<OrchestratorState>) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(orchestration::CreateTheme))
+        .register(Box::new(orchestration::CreateArticle))
+        .register(Box::new(orchestration::ListArticles))
+        .register(Box::new(orchestration::DispatchWriter::new(Arc::clone(
+            &state,
+        ))))
+        .register(Box::new(orchestration::ListReports::new(state)));
+    registry
+}
+
+/// The result of a completed [`Master::run_goal`] orchestration.
+///
+/// It bundles how the master's own run ended with the concrete work product —
+/// every [`SlaveReport`] the model collected while pursuing the goal — so a caller
+/// can render the outcome without re-reading the master's transcript.
+#[derive(Debug, Clone)]
+pub struct GoalOutcome {
+    /// The master run's terminal outcome label: `"done"` when the model finished
+    /// cleanly, or `"need_human"` when it stopped early (e.g. the round budget was
+    /// exhausted). A fatal error surfaces as an `Err` from
+    /// [`Master::run_goal`] rather than here.
+    pub outcome: String,
+    /// The master's final assistant message (its closing summary), empty when the
+    /// run ended without a final `stop` message.
+    pub message: String,
+    /// Every [`SlaveReport`] collected during the run, in dispatch order — the
+    /// per-article outcomes the model gathered.
+    pub reports: Vec<SlaveReport>,
 }
 
 /// Wraps a workspace-setup [`ToolError`](crate::tool::ToolError) as a
@@ -781,5 +986,275 @@ mod tests {
         assert_eq!(kinds.last(), Some(&"SlaveReported"));
         assert!(kinds.contains(&"SessionStarted"));
         assert!(kinds.contains(&"Finished"));
+    }
+
+    // --- run_goal: full LLM-driven orchestration over a loopback fake --------
+
+    /// Spawns a one-shot loopback HTTP server that answers each incoming POST with
+    /// the next canned body in `bodies` (200 OK), in order, then exits.
+    ///
+    /// This is the same fake pattern the session tests use: it serves fixed JSON
+    /// over `127.0.0.1`, so a full master/slave run can be exercised with zero
+    /// network egress. Because [`Master::run_goal`] dispatches each writer
+    /// synchronously (the master round blocks until the slave joins), every
+    /// request — master rounds and the interleaved slave round alike — arrives in
+    /// a single deterministic order, so one ordered list of bodies suffices.
+    fn spawn_ordered_fake_api(bodies: Vec<String>) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().expect("accept");
+                // Drain the request: read headers, then the Content-Length body.
+                let mut buf = [0u8; 8192];
+                let mut data = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).expect("read request");
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&data);
+                    if let Some(headers_end) = text.find("\r\n\r\n") {
+                        let header_block = &text[..headers_end];
+                        let content_len = header_block
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.to_ascii_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        let body_so_far = data.len() - (headers_end + 4);
+                        if body_so_far >= content_len {
+                            break;
+                        }
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.as_bytes().len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).expect("write resp");
+                stream.flush().ok();
+            }
+        });
+        base
+    }
+
+    /// A canned assistant response that issues a single tool call to `name` with
+    /// the given JSON `arguments`, with `tool_calls` as the finish reason.
+    fn tool_call_body(call_id: &str, name: &str, arguments: serde_json::Value) -> String {
+        serde_json::json!({
+            "id": call_id,
+            "object": "chat.completion",
+            "created": 0,
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": format!("calling {name}"),
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments.to_string() }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8,
+                "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 5
+            }
+        })
+        .to_string()
+    }
+
+    /// A canned final `stop` response carrying `text`.
+    fn stop_body(text: &str) -> String {
+        serde_json::json!({
+            "id": "stop",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": text },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 6, "completion_tokens": 2, "total_tokens": 8,
+                "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 6
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn run_goal_plans_dispatches_and_aggregates_over_a_fake() {
+        // The scripted master conversation:
+        //   r1: create_theme rust
+        //   r2: create_article rust/intro.md
+        //   r3: dispatch_writer rust/intro.md  -> spawns a slave (1 round) then
+        //       the master round completes with the slave's report
+        //   r4: stop (final summary)
+        // Interleaved on the wire (the slave round runs *inside* r3's dispatch):
+        //   master-r1, master-r2, master-r3, SLAVE, master-r4
+        let bodies = vec![
+            tool_call_body("c1", "create_theme", serde_json::json!({ "theme": "rust" })),
+            tool_call_body(
+                "c2",
+                "create_article",
+                serde_json::json!({ "theme": "rust", "file_name": "intro.md", "title": "Intro" }),
+            ),
+            tool_call_body(
+                "c3",
+                "dispatch_writer",
+                serde_json::json!({
+                    "theme": "rust",
+                    "file_name": "intro.md",
+                    "task": "Write a short intro to ownership."
+                }),
+            ),
+            // The slave's single round: it stops without calling `report`, so the
+            // engine synthesizes a `done` report from the terminal step.
+            stop_body("intro drafted"),
+            // The master's closing summary.
+            stop_body("All articles written: rust/intro.md is done."),
+        ];
+        let base = spawn_ordered_fake_api(bodies);
+
+        let client = Client::builder()
+            .api_key("test-key")
+            .base_url(base)
+            .build()
+            .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = Workspace::open(dir.path()).expect("open workspace");
+
+        // The session handed to `new` only needs to carry the client; `run_goal`
+        // reconfigures it with the orchestration tools and master prompt.
+        let session = Session::new(
+            client,
+            "placeholder",
+            crate::tool::ToolRegistry::new(),
+            SessionOptions::default(),
+        );
+        let mut master = Master::new(session, ws);
+
+        let outcome = master
+            .run_goal(
+                "Write a short beginner guide to Rust ownership.",
+                SessionOptions::default(),
+                "deepseek-v4-pro",
+            )
+            .expect("goal runs without a fatal error");
+
+        // The master finished cleanly with its summary.
+        assert_eq!(outcome.outcome, "done");
+        assert_eq!(
+            outcome.message,
+            "All articles written: rust/intro.md is done."
+        );
+
+        // Exactly one writer was dispatched and its report aggregated.
+        assert_eq!(outcome.reports.len(), 1, "one writer dispatched");
+        assert_eq!(outcome.reports[0].status, SlaveStatus::Done);
+
+        // The plan's structural side effects landed on disk: the theme and the
+        // article the model created exist and are listable.
+        let probe = Workspace::open(dir.path()).expect("reopen");
+        assert_eq!(probe.list_articles("rust").unwrap(), vec!["intro.md"]);
+
+        // The master's own planning rounds accrued token usage (it really drove
+        // the model), distinct from the deterministic `run_one` path.
+        assert!(master.usage().rounds >= 1, "master ran real rounds");
+    }
+
+    #[test]
+    fn run_goal_surfaces_a_collected_slave_failure_without_erroring() {
+        // The master dispatches one writer whose slave round ends in a *fatal*
+        // (non-transient) error — HTTP 400, which is never retried — so exactly
+        // one slave request is served. The slave's failure becomes a `Failed`
+        // report carried back in the outcome, NOT an `Err` from `run_goal`.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            // master-r1: dispatch_writer; SLAVE: 400 (fatal); master-r2: stop.
+            let dispatch = tool_call_body(
+                "c1",
+                "dispatch_writer",
+                serde_json::json!({
+                    "theme": "rust",
+                    "file_name": "intro.md",
+                    "task": "Write something."
+                }),
+            );
+            let summary = stop_body("A writer failed; reporting back.");
+            // (body, status_line). HTTP 400 is non-transient, so the slave does
+            // not retry and the fake server serves exactly these three requests.
+            let steps: Vec<(String, &str)> = vec![
+                (dispatch, "200 OK"),
+                (
+                    String::from("{\"error\":{\"message\":\"bad request\"}}"),
+                    "400 Bad Request",
+                ),
+                (summary, "200 OK"),
+            ];
+            for (body, status) in steps {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.as_bytes().len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                stream.flush().ok();
+            }
+        });
+
+        let client = Client::builder()
+            .api_key("test-key")
+            .base_url(base)
+            .build()
+            .expect("client");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = Workspace::open(dir.path()).expect("open workspace");
+        // Pre-create the article so the failure is the slave's round, not setup.
+        let mut setup = Workspace::open(dir.path()).expect("setup ws");
+        setup.create_theme("rust").unwrap();
+        setup
+            .create_article("rust", "intro.md", "Intro", None)
+            .unwrap();
+
+        let session = Session::new(
+            client,
+            "placeholder",
+            crate::tool::ToolRegistry::new(),
+            SessionOptions::default(),
+        );
+        let mut master = Master::new(session, ws);
+
+        let outcome = master
+            .run_goal(
+                "Write one article.",
+                SessionOptions::default(),
+                "deepseek-v4-pro",
+            )
+            .expect("a collected slave failure is not a master error");
+
+        assert_eq!(outcome.outcome, "done");
+        assert_eq!(outcome.reports.len(), 1);
+        assert_eq!(outcome.reports[0].status, SlaveStatus::Failed);
     }
 }

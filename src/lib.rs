@@ -9,6 +9,12 @@ pub mod req;
 // (no IO), always available; the DSL and provenance layers are built on it.
 pub mod content;
 
+// v2 layers on the content model (pure, always available). Pre-declared so each
+// is implemented in its own worktree without touching this file; see
+// `docs/impl-v2.md`.
+pub mod dsl;
+pub mod provenance;
+
 // The v0 collaborative-writing layers are synchronous (sync + `std::thread`),
 // built on the blocking `req` client, so they are gated on the `blocking`
 // feature.

@@ -5,6 +5,10 @@
 
 pub mod req;
 
+// The shared rich-text content model with character-level authorship. Pure data
+// (no IO), always available; the DSL and provenance layers are built on it.
+pub mod content;
+
 // The v0 collaborative-writing layers are synchronous (sync + `std::thread`),
 // built on the blocking `req` client, so they are gated on the `blocking`
 // feature.

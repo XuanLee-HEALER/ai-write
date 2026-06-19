@@ -1,7 +1,14 @@
 # ai-write 任务运行器(just）
 
-# 默认:类型检查全 feature
-default: check
+# Windows 走 PowerShell 7;macOS / Linux 仍用默认 shell(sh)。
+set windows-shell := ['pwsh.exe', '-NoLogo', '-Command']
+# 自动加载根目录 .env(替代各 recipe 里的 `set -a; . ./.env; set +a`),
+# 文件不存在时静默跳过;DEEPSEEK_API_KEY 等密钥即由它注入。
+set dotenv-load := true
+
+# 默认:列出所有 recipe
+default:
+    @just --list
 
 # 交付前全套校验:格式检查 + lint + 全 feature check
 ci: fmt-check lint check
@@ -39,23 +46,28 @@ lint:
     cargo clippy --all-features -- -D warnings
 
 # 生成文档(intra-doc 链接断裂即报错,验证 rustdoc 干净)
+[unix]
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
+[windows]
+doc:
+    $env:RUSTDOCFLAGS = "-D warnings"; cargo doc --no-deps --all-features
+
 # 真机集成测试(读 .env 的 DEEPSEEK_API_KEY,跑 #[ignore] 的 live_* 用例)
 test-live:
-    set -a; . ./.env; set +a; cargo test --all-features -- --ignored --nocapture
+    cargo test --all-features -- --ignored --nocapture
 
 # 真机 demo(读 .env 的 DEEPSEEK_API_KEY):Master 派一个 Slave 写一篇文章到 workspace/<主题>/
 # 用法:just demo "<主题>" "<写作任务>"
 demo theme task:
-    set -a; . ./.env; set +a; cargo run --bin demo -- "{{theme}}" "{{task}}"
+    cargo run --bin demo -- "{{theme}}" "{{task}}"
 
 # 后端域 API(读 .env 的 DEEPSEEK_API_KEY):axum 纯 JSON/SSE API,**不再内嵌 UI**。
 # UI 是 web/ 的 SvelteKit 前端(见 web-dev / dev)。默认监听 127.0.0.1:8080,
 # 工作区 ./workspace(可用 AI_WRITE_BIND / AI_WRITE_WORKSPACE / AI_WRITE_SKILLS 覆盖)。
 webui:
-    set -a; . ./.env; set +a; cargo run --bin webui --features webui
+    cargo run --bin webui --features webui
 
 # `api` 是 `webui` 的别名(语义更准:它现在是纯后端 API)。
 api: webui
@@ -87,13 +99,28 @@ web-serve:
 
 # 一键全栈本地开发:后端 API(:8080,后台)+ 前端 dev(:5173,前台);Ctrl-C 一起停。
 # 首次先 `just web-install`。起来后浏览器开 http://localhost:5173
+[unix]
 dev:
     #!/usr/bin/env bash
     set -uo pipefail
-    set -a; . ./.env; set +a
     echo "▸ 启动后端 API (axum) on http://127.0.0.1:8080 …"
     cargo run --bin webui --features webui &
     api_pid=$!
     trap 'echo; echo "▸ 停止后端 API ($api_pid)"; kill $api_pid 2>/dev/null || true' EXIT INT TERM
     echo "▸ 启动前端 dev (vite) on http://localhost:5173  (Ctrl-C 停止全部)"
     cd web && bun run dev
+
+[windows]
+dev:
+    #!/usr/bin/env pwsh
+    $ErrorActionPreference = 'Stop'
+    Write-Host "▸ 启动后端 API (axum) on http://127.0.0.1:8080 …"
+    $api = Start-Process cargo -ArgumentList 'run','--bin','webui','--features','webui' -NoNewWindow -PassThru
+    try {
+        Write-Host "▸ 启动前端 dev (vite) on http://localhost:5173  (Ctrl-C 停止全部)"
+        Set-Location web
+        bun run dev
+    } finally {
+        Write-Host "▸ 停止后端 API ($($api.Id))"
+        Stop-Process -Id $api.Id -ErrorAction SilentlyContinue
+    }

@@ -208,6 +208,103 @@ pub fn apply_edit(text: &mut RichText, edit: Edit, author: &AuthorId) -> Result<
     Ok(())
 }
 
+/// Re-authors `text` so its plain string becomes `new_text`, attributing **only
+/// the changed span** to `author` and preserving the original authorship of every
+/// character that is unchanged.
+///
+/// This is the authorship-preserving "the editor handed me a whole new body"
+/// primitive the workspace's [`apply_edit`]-routed write path
+/// (`docs/impl-v2-results.md` §5) builds on: the three byte-level editing tools
+/// (`write_article` / `edit_article` / `apply_edits`) and the human `PUT` all
+/// compute a full new body, but most of it is usually unchanged. Rather than
+/// blaming the entire body on the latest writer, this trims the longest common
+/// prefix and suffix (on UTF-8 character boundaries) shared by the old and new
+/// text and replaces just the differing middle through the single edit primitive
+/// [`apply_edit`]. The untouched prefix and suffix keep whoever wrote them; the
+/// rewritten middle is attributed to `author`. When `new_text` equals the current
+/// plain string the call is a no-op (no authorship changes).
+///
+/// The reconciliation is a contiguous-span replace, not a full longest-common-
+/// subsequence realignment: a single edit appears as one changed region, which is
+/// exactly how a human or agent edit looks and keeps the cost linear. (Character-
+/// level realignment across scattered edits is [`diff`]'s job, for visualization,
+/// not persistence.)
+///
+/// On success `text` is updated in place to carry the new content and its blended
+/// authorship.
+///
+/// # Errors
+///
+/// Returns a [`ProvenanceError`] only if the internal span replace does — which,
+/// because the prefix/suffix are computed on character boundaries of both texts,
+/// does not happen for valid UTF-8 inputs; the signature returns [`Result`] so the
+/// guarantee is enforced rather than assumed.
+///
+/// # Examples
+///
+/// ```
+/// use ai_write::content::{AuthorId, RichText};
+/// use ai_write::provenance::{contributors_of, reauthor};
+///
+/// let agent = AuthorId::Agent { model: "m".into(), label: "a".into() };
+/// // The human wrote the whole sentence.
+/// let mut body = RichText::from_plain("the quick brown fox", AuthorId::Human);
+///
+/// // The agent rewrites just the middle word.
+/// reauthor(&mut body, "the quick red fox", &agent).unwrap();
+/// assert_eq!(body.plain_string(), "the quick red fox");
+///
+/// // "the quick " and " fox" stay the human's; "red" is the agent's.
+/// let who: Vec<_> = contributors_of(&body).into_iter().cloned().collect();
+/// assert_eq!(who, vec![AuthorId::Human, agent]);
+/// ```
+pub fn reauthor(text: &mut RichText, new_text: &str, author: &AuthorId) -> Result<()> {
+    let old: String = text.plain_string();
+    if old == new_text {
+        return Ok(());
+    }
+    let old_bytes = old.as_bytes();
+    let new_bytes = new_text.as_bytes();
+
+    // Longest common byte prefix, then backed off to a char boundary of both.
+    let max_prefix = old_bytes.len().min(new_bytes.len());
+    let mut prefix = 0;
+    while prefix < max_prefix && old_bytes[prefix] == new_bytes[prefix] {
+        prefix += 1;
+    }
+    while prefix > 0 && (!old.is_char_boundary(prefix) || !new_text.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+
+    // Longest common byte suffix that does not overlap the prefix, backed off to a
+    // char boundary of both texts.
+    let max_suffix = (old_bytes.len() - prefix).min(new_bytes.len() - prefix);
+    let mut suffix = 0;
+    while suffix < max_suffix
+        && old_bytes[old_bytes.len() - 1 - suffix] == new_bytes[new_bytes.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let mut old_suffix_start = old_bytes.len() - suffix;
+    let mut new_suffix_start = new_bytes.len() - suffix;
+    while suffix > 0
+        && (!old.is_char_boundary(old_suffix_start) || !new_text.is_char_boundary(new_suffix_start))
+    {
+        suffix -= 1;
+        old_suffix_start = old_bytes.len() - suffix;
+        new_suffix_start = new_bytes.len() - suffix;
+    }
+
+    // Replace the differing middle [prefix, old_len - suffix) of the old text with
+    // the differing middle of the new text, attributed to `author`.
+    let replacement = new_text[prefix..new_suffix_start].to_string();
+    apply_edit(
+        text,
+        Edit::replace(prefix..old_suffix_start, replacement),
+        author,
+    )
+}
+
 /// Splices `replacement` (authored by `author`) into the byte `range` of `text`,
 /// returning the new (not-yet-normalized) run list.
 ///
@@ -502,6 +599,155 @@ pub fn contributors(doc: &Document) -> Vec<String> {
         }
     }
     seen
+}
+
+/// Flattens an authored [`Document`] body into a single [`RichText`], the
+/// run-preserving inverse of [`paragraph_document`].
+///
+/// Block prose is concatenated in reading order with a blank line (`"\n\n"`)
+/// between blocks, mirroring [`Document::to_plain_string`], while every run keeps
+/// its author — so the result is the whole article body as one authored string.
+/// The blank-line separators are attributed to the author of the block they
+/// follow. This is how the workspace's authorship layer reconciles a full new
+/// body against the stored authorship: flatten, [`reauthor`], then rebuild with
+/// [`paragraph_document`].
+///
+/// A [`Block::CodeBlock`] (no per-character authorship in the content model)
+/// contributes its code attributed to `code_author`, which the caller supplies
+/// because the model itself does not record one.
+///
+/// # Examples
+///
+/// ```
+/// use ai_write::content::{AuthorId, Block, Document, RichText};
+/// use ai_write::provenance::flatten_body;
+///
+/// let mut doc = Document::new();
+/// doc.push(Block::Paragraph(RichText::from_plain("one", AuthorId::Human)))
+///     .push(Block::Paragraph(RichText::from_plain("two", AuthorId::Human)));
+/// let body = flatten_body(&doc, &AuthorId::Human);
+/// assert_eq!(body.plain_string(), "one\n\ntwo");
+/// ```
+pub fn flatten_body(doc: &Document, code_author: &AuthorId) -> RichText {
+    let mut out = RichText::empty();
+    for (i, block) in doc.blocks.iter().enumerate() {
+        let (runs, sep_author): (&[Run], AuthorId) = match block {
+            Block::Paragraph(t) | Block::ListItem(t) | Block::Quote(t) => (
+                &t.runs,
+                t.runs
+                    .first()
+                    .map(|r| r.author.clone())
+                    .unwrap_or_else(|| code_author.clone()),
+            ),
+            Block::Heading { text, .. } => (
+                &text.runs,
+                text.runs
+                    .first()
+                    .map(|r| r.author.clone())
+                    .unwrap_or_else(|| code_author.clone()),
+            ),
+            Block::CodeBlock { code, .. } => {
+                if i > 0 {
+                    out.runs.push(Run::new("\n\n", code_author.clone()));
+                }
+                if !code.is_empty() {
+                    out.runs.push(Run::new(code.clone(), code_author.clone()));
+                }
+                continue;
+            }
+        };
+        if i > 0 {
+            out.runs.push(Run::new("\n\n", sep_author));
+        }
+        for run in runs {
+            out.runs.push(run.clone());
+        }
+    }
+    normalize(&mut out);
+    out
+}
+
+/// Splits an authored body [`RichText`] into a paragraph [`Document`], the inverse
+/// of [`flatten_body`].
+///
+/// The body's plain string is split on blank lines (`"\n\n"`) into paragraphs, and
+/// each paragraph keeps the run authorship of exactly the characters it spans — so
+/// re-flattening with [`flatten_body`] reproduces the input. The resulting blocks
+/// are all [`Block::Paragraph`]: the workspace body is free-form prose, so it is
+/// modelled as paragraphs rather than parsed through the strict DSL grammar (which
+/// would reject ordinary text that does not start with a block sigil). An empty
+/// body yields an empty [`Document`].
+///
+/// This is the shape the rich article view is built from: each paragraph block, in
+/// reading order, exposes its authored runs so the front-end can colour each run
+/// by its author tag.
+///
+/// # Examples
+///
+/// ```
+/// use ai_write::content::{AuthorId, Block, RichText, Run};
+/// use ai_write::provenance::paragraph_document;
+///
+/// let agent = AuthorId::Agent { model: "m".into(), label: "a".into() };
+/// let body = RichText {
+///     runs: vec![
+///         Run::new("hello ", AuthorId::Human),
+///         Run::new("world\n\nbye", agent.clone()),
+///     ],
+/// };
+/// let doc = paragraph_document(&body);
+/// assert_eq!(doc.blocks.len(), 2);
+/// // The first paragraph spans two authors; the second is all the agent's.
+/// assert!(matches!(&doc.blocks[0], Block::Paragraph(t) if t.runs.len() == 2));
+/// ```
+pub fn paragraph_document(body: &RichText) -> Document {
+    let plain = body.plain_string();
+    let mut doc = Document::new();
+    if plain.is_empty() {
+        return doc;
+    }
+    // Byte offsets at which each paragraph starts and ends, derived from the blank
+    // line separators in the plain string.
+    let mut cursor = 0usize;
+    let mut para_start = 0usize;
+    let sep = "\n\n";
+    let bytes = plain.as_bytes();
+    while cursor + sep.len() <= bytes.len() {
+        if &bytes[cursor..cursor + sep.len()] == sep.as_bytes() {
+            doc.push(Block::Paragraph(slice_runs(body, para_start, cursor)));
+            cursor += sep.len();
+            para_start = cursor;
+        } else {
+            cursor += 1;
+        }
+    }
+    doc.push(Block::Paragraph(slice_runs(body, para_start, plain.len())));
+    doc
+}
+
+/// Returns the sub-[`RichText`] of `body` covering byte range `start..end`, with
+/// run authorship preserved and split at the boundaries.
+fn slice_runs(body: &RichText, start: usize, end: usize) -> RichText {
+    let mut out = RichText::empty();
+    let mut cursor = 0usize;
+    for run in &body.runs {
+        let run_start = cursor;
+        let run_end = cursor + run.text.len();
+        cursor = run_end;
+        let lo = run_start.max(start);
+        let hi = run_end.min(end);
+        if lo < hi {
+            out.runs.push(Run::new(
+                run.text[lo - run_start..hi - run_start].to_string(),
+                run.author.clone(),
+            ));
+        }
+        if run_end >= end {
+            break;
+        }
+    }
+    normalize(&mut out);
+    out
 }
 
 /// One step of an author-attributed diff between two [`RichText`] values.

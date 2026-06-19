@@ -10,6 +10,7 @@
 //! | [`CreateTheme`] | Create a theme directory the articles will live in. |
 //! | [`CreateArticle`] | Create one empty article file inside a theme. |
 //! | [`ListArticles`] | List the article files currently in a theme. |
+//! | [`OrganizeArticles`] | Set the articles' parent/child hierarchy and reading order. |
 //! | [`DispatchWriter`] | Spawn a slave (its own thread + sandboxed session) to write one article, blocking until it reports, and record the [`SlaveReport`]. |
 //! | [`ListReports`] | Surface every [`SlaveReport`] collected so far back to the model. |
 //!
@@ -44,13 +45,14 @@ use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::coordinator::Coordinator;
 use crate::observe::EventSink;
 use crate::req::blocking::Client;
 use crate::req::{FunctionDef, Tool as ReqTool};
 use crate::tool::workspace::WriterId;
 use crate::tool::{Tool, ToolCtx, ToolError, ToolResult};
 
-use super::{SlaveReport, SlaveTask, spawn_slave_with_sink};
+use super::{SlaveReport, SlaveSkill, SlaveTask, spawn_slave_with_coordinator};
 
 /// The shared state behind the master's dispatch / report tools.
 ///
@@ -74,6 +76,19 @@ pub(crate) struct OrchestratorState {
     /// The model id slaves run under, recorded as their writer identity so the
     /// article's contributor provenance names the model that produced it.
     slave_model: String,
+    /// The composed system prompt every dispatched slave runs under (the selected
+    /// writing skill ahead of the fixed operational rules, or the engine default).
+    ///
+    /// This is the static fallback. When [`slave_skill`](OrchestratorState::slave_skill)
+    /// is set, each slave instead recomposes its prompt from that skill file every
+    /// round (kernel §4), and this string is only the fallback on a read failure.
+    slave_prompt: String,
+    /// An optional on-disk skill source each dispatched slave re-reads per round
+    /// (kernel §4). `None` keeps slaves pinned to [`slave_prompt`](OrchestratorState::slave_prompt).
+    slave_skill: Option<SlaveSkill>,
+    /// The single transaction [`Coordinator`] (kernel §6) every dispatched slave
+    /// shares with the master, so all edits funnel through one lock table + Vcs.
+    coordinator: Arc<Coordinator>,
     /// Every report collected so far, in dispatch order. Guarded by a mutex so
     /// the dispatch tool can append while [`Master::run_goal`](crate::engine::Master::run_goal)
     /// reads them back.
@@ -87,14 +102,32 @@ impl OrchestratorState {
         workspace_root: String,
         events: Arc<dyn EventSink>,
         slave_model: String,
+        slave_prompt: String,
+        coordinator: Arc<Coordinator>,
     ) -> Self {
         OrchestratorState {
             client,
             workspace_root,
             events,
             slave_model,
+            slave_prompt,
+            slave_skill: None,
+            coordinator,
             reports: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Sets the on-disk skill source every dispatched slave re-reads per round
+    /// (kernel §4), returning `self` for chaining.
+    ///
+    /// With a skill source set, each slave gets a
+    /// [system-prompt provider](crate::session::Session::set_system_provider) that
+    /// recomposes its prompt from the skill file each round; the static
+    /// [`slave_prompt`](OrchestratorState::slave_prompt) remains the fallback on a
+    /// read failure. `None` (the default) leaves slaves on the static prompt.
+    pub(crate) fn with_slave_skill(mut self, skill: Option<SlaveSkill>) -> Self {
+        self.slave_skill = skill;
+        self
     }
 
     /// Returns a snapshot of every [`SlaveReport`] collected so far, in dispatch
@@ -109,9 +142,11 @@ impl OrchestratorState {
     /// Dispatches a slave for one article on its own thread, blocks until it
     /// reports, records the report, and returns it.
     ///
-    /// The slave is spawned through [`spawn_slave_with_sink`] so its lifecycle and
-    /// inner steps narrate into the master's event feed. Joining a panicked slave
-    /// thread yields a `Failed` report rather than propagating the panic, matching
+    /// The slave is spawned through
+    /// [`super::spawn_slave_with_coordinator`] so it
+    /// shares the master's single coordinator and its lifecycle / inner steps
+    /// narrate into the master's event feed. Joining a panicked slave thread yields
+    /// a `Failed` report rather than propagating the panic, matching
     /// [`Master::run_one`](crate::engine::Master::run_one).
     fn dispatch(&self, theme: &str, file_name: &str, task: &str, label: &str) -> SlaveReport {
         let writer = WriterId::Agent {
@@ -123,12 +158,15 @@ impl OrchestratorState {
             file_name: file_name.to_string(),
             task: task.to_string(),
             writer,
+            system_prompt: Some(self.slave_prompt.clone()),
+            skill: self.slave_skill.clone(),
         };
-        let handle = spawn_slave_with_sink(
+        let handle = spawn_slave_with_coordinator(
             self.client.clone(),
             self.workspace_root.clone(),
             slave_task,
             Arc::clone(&self.events),
+            Arc::clone(&self.coordinator),
         );
         let report = handle
             .join()
@@ -316,6 +354,99 @@ impl Tool for ListArticles {
     }
 }
 
+/// Organizes a theme's articles into a logical hierarchy (parent/child) and an
+/// optional reading order, in one call.
+///
+/// This is how the master records *structure* on the article set it created: who
+/// nests under whom, and the sequence a reader should follow. Both are written
+/// through the sandboxed workspace ([`Workspace::set_parent`](crate::tool::workspace::Workspace::set_parent)
+/// / [`Workspace::reorder`](crate::tool::workspace::Workspace::reorder)), so the
+/// same guards apply — articles and parents must exist, no cycles, and a reorder
+/// must be a permutation of the current articles.
+pub struct OrganizeArticles;
+
+/// One parent assignment in an [`OrganizeArticles`] call.
+#[derive(Deserialize)]
+struct Relation {
+    file_name: String,
+    #[serde(default)]
+    parent: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OrganizeArgs {
+    theme: String,
+    #[serde(default)]
+    relations: Vec<Relation>,
+    #[serde(default)]
+    order: Option<Vec<String>>,
+}
+
+impl Tool for OrganizeArticles {
+    fn name(&self) -> &str {
+        "organize_articles"
+    }
+
+    fn schema(&self) -> ReqTool {
+        def(
+            "organize_articles",
+            "Organize a theme's articles into a logical hierarchy and reading \
+             order. Provide `relations` to set each article's parent (use a null \
+             or omitted parent for a top-level article), and/or `order` to set the \
+             full reading order (must list every article in the theme exactly \
+             once). Articles and parents must already exist; a parent may not form \
+             a cycle. Use this after creating the articles to express how they \
+             relate and the sequence a reader should follow.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "theme": string_prop("The theme whose articles to organize."),
+                    "relations": {
+                        "type": "array",
+                        "description": "Parent assignments; each sets one article's parent.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file_name": string_prop("The article whose parent to set."),
+                                "parent": string_prop("The parent article's file name; null or omitted for top-level."),
+                            },
+                            "required": ["file_name"],
+                        },
+                    },
+                    "order": {
+                        "type": "array",
+                        "description": "Optional full reading order: every article file name in the theme, exactly once.",
+                        "items": { "type": "string" },
+                    },
+                },
+                "required": ["theme"],
+            }),
+        )
+    }
+
+    fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
+        let a: OrganizeArgs = parse_args(args)?;
+        let mut relations_set = 0usize;
+        for rel in &a.relations {
+            ctx.ws
+                .set_parent(&a.theme, &rel.file_name, rel.parent.as_deref())?;
+            relations_set += 1;
+        }
+        let reordered = match a.order {
+            Some(order) => {
+                ctx.ws.reorder(&a.theme, order)?;
+                true
+            }
+            None => false,
+        };
+        Ok(json!({
+            "theme": a.theme,
+            "relations_set": relations_set,
+            "reordered": reordered,
+        }))
+    }
+}
+
 // ===========================================================================
 // Dispatch / report (operate on the shared OrchestratorState)
 // ===========================================================================
@@ -323,10 +454,10 @@ impl Tool for ListArticles {
 /// Spawns a slave to write one article and records its [`SlaveReport`].
 ///
 /// This is the master's delegation primitive: each call dispatches one
-/// [`spawn_slave_with_sink`] thread for the named article with the given task,
-/// **blocks** until the slave reports, appends the report to the shared
-/// orchestrator state, and returns the report to the model so it can decide what
-/// to do next.
+/// [`super::spawn_slave_with_coordinator`] thread
+/// for the named article with the given task, **blocks** until the slave reports,
+/// appends the report to the shared orchestrator state, and returns the report to
+/// the model so it can decide what to do next.
 pub struct DispatchWriter {
     /// The shared orchestration state the dispatched report is recorded into.
     state: Arc<OrchestratorState>,
@@ -506,6 +637,75 @@ mod tests {
     }
 
     #[test]
+    fn organize_articles_sets_hierarchy_and_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ws = Workspace::open(dir.path()).expect("open");
+        call(&mut ws, &CreateTheme, json!({ "theme": "rust" })).unwrap();
+        for f in ["a.md", "b.md", "c.md"] {
+            call(
+                &mut ws,
+                &CreateArticle,
+                json!({ "theme": "rust", "file_name": f }),
+            )
+            .unwrap();
+        }
+
+        let out = call(
+            &mut ws,
+            &OrganizeArticles,
+            json!({
+                "theme": "rust",
+                "relations": [
+                    { "file_name": "b.md", "parent": "a.md" },
+                    { "file_name": "c.md", "parent": "b.md" }
+                ],
+                "order": ["a.md", "b.md", "c.md"]
+            }),
+        )
+        .unwrap();
+        assert_eq!(out["relations_set"], json!(2));
+        assert_eq!(out["reordered"], json!(true));
+
+        let outline = ws.article_outline("rust").unwrap();
+        assert_eq!(outline[1].file, "b.md");
+        assert_eq!(outline[1].parent.as_deref(), Some("a.md"));
+        assert_eq!(outline[2].depth, 2);
+    }
+
+    #[test]
+    fn organize_articles_propagates_workspace_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ws = Workspace::open(dir.path()).expect("open");
+        call(&mut ws, &CreateTheme, json!({ "theme": "rust" })).unwrap();
+        call(
+            &mut ws,
+            &CreateArticle,
+            json!({ "theme": "rust", "file_name": "a.md" }),
+        )
+        .unwrap();
+        // Parent does not exist -> NotFound bubbles up from set_parent.
+        let err = call(
+            &mut ws,
+            &OrganizeArticles,
+            json!({
+                "theme": "rust",
+                "relations": [ { "file_name": "a.md", "parent": "ghost.md" } ]
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+
+        // A reorder that is not a permutation -> InvalidArgs.
+        let err = call(
+            &mut ws,
+            &OrganizeArticles,
+            json!({ "theme": "rust", "order": ["a.md", "b.md"] }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+
+    #[test]
     fn create_article_missing_theme_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut ws = Workspace::open(dir.path()).expect("open");
@@ -527,6 +727,8 @@ mod tests {
             dir.path().to_string_lossy().into_owned(),
             Arc::new(crate::observe::NullSink),
             "deepseek-v4-flash".to_string(),
+            String::new(),
+            test_coordinator(dir.path()),
         ));
         let tool = DispatchWriter::new(Arc::clone(&state));
         let err = call(
@@ -547,6 +749,8 @@ mod tests {
             dir.path().to_string_lossy().into_owned(),
             Arc::new(crate::observe::NullSink),
             "deepseek-v4-flash".to_string(),
+            String::new(),
+            test_coordinator(dir.path()),
         ));
         let tool = ListReports::new(Arc::clone(&state));
         let out = call(&mut ws, &tool, json!({})).unwrap();
@@ -561,6 +765,11 @@ mod tests {
             .api_key("test-key")
             .build()
             .expect("offline client")
+    }
+
+    /// A coordinator rooted at `root`, for constructing orchestration state.
+    fn test_coordinator(root: &std::path::Path) -> Arc<Coordinator> {
+        Arc::new(Coordinator::open(root).expect("coordinator"))
     }
 
     #[test]
@@ -612,6 +821,8 @@ mod tests {
             dir.path().to_string_lossy().into_owned(),
             Arc::new(crate::observe::NullSink),
             "deepseek-v4-flash".to_string(),
+            crate::engine::default_slave_prompt(),
+            test_coordinator(dir.path()),
         ));
         let dispatch = DispatchWriter::new(Arc::clone(&state));
 

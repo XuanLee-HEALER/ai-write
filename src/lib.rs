@@ -15,11 +15,34 @@ pub mod content;
 pub mod dsl;
 pub mod provenance;
 
+// Writing skills: named system-prompt presets loaded from `./skills/*.md`. Pure
+// (std fs + string parsing), always available; the engine composes a chosen
+// skill with its fixed operational preamble, and the WebUI lets a user pick one
+// when talking to the master. See `docs/impl-v3.md`.
+pub mod skill;
+
 // The v0 collaborative-writing layers are synchronous (sync + `std::thread`),
 // built on the blocking `req` client, so they are gated on the `blocking`
 // feature.
 #[cfg(feature = "blocking")]
 pub mod engine;
+
+// The operation-level transaction coordinator (kernel §6): the single authority
+// for every mutating workspace operation. It owns the workspace lock state and
+// the one non-`Sync` `Vcs` handle, grants declared locks all-or-nothing
+// (deadlock-free), schedules humans queue-head, and commits one cognitive unit
+// per transaction inside the critical section. Synchronous, built on the
+// `blocking` workspace + `vcs` layers.
+#[cfg(feature = "blocking")]
+pub mod coordinator;
+
+// Web / reference search as a pluggable capability (kernel §10: 搜索经第三方
+// MCP). A `SearchProvider` trait + a native `search` tool + a no-network stub
+// provider, orthogonal to the local substring `find`. Built on the `tool` layer
+// (`Tool`/`ToolCtx`), so gated on `blocking`. The crate ships only the contract
+// and the stub; a session-connected MCP backend is plugged in as a provider.
+#[cfg(feature = "blocking")]
+pub mod search;
 #[cfg(feature = "blocking")]
 pub mod session;
 #[cfg(feature = "blocking")]

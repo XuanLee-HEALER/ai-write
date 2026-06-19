@@ -1,8 +1,10 @@
 //! General-purpose, stateful agentic session over the stateless [`req`] client.
 //!
 //! A [`Session`] is the **business-agnostic** turn engine that both the `Master`
-//! and `Slave` roles in [`engine`](crate::engine) are built on. It owns a fixed
-//! system prompt, the running message history, cumulative token usage, and a
+//! and `Slave` roles in [`engine`](crate::engine) are built on. It owns a system
+//! prompt (a fixed string, or — via [`Session::set_system_provider`] — a closure
+//! re-evaluated each round so the prompt can be re-read from disk; kernel §4), the
+//! running message history, cumulative token usage, and a
 //! handle to a [`ToolRegistry`]. Each *round* assembles
 //! the messages, performs one [`req`] chat completion (advertising the registered
 //! tools), branches on the returned [`FinishReason`],
@@ -25,12 +27,14 @@
 //! [`req`]: crate::req
 //! [`Client`]: crate::req::blocking::Client
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::coordinator::Coordinator;
 use crate::observe::{Event, EventSink, NullSink};
 use crate::req::blocking::Client;
 use crate::req::{ChatRequest, FinishReason, Message, Model, Thinking, ToolChoice, Usage};
@@ -133,9 +137,9 @@ pub enum Step {
 /// snapshot.
 ///
 /// The system prompt is intentionally **not** part of these options (it is passed
-/// separately to [`Session::new`]); per the v0 design the system prompt is fixed
-/// for the lifetime of the session, while skills are injected as ordinary
-/// messages rather than by rewriting it.
+/// separately to [`Session::new`], or supplied per round by a
+/// [system-prompt provider](Session::set_system_provider) for the kernel §4
+/// re-read-from-disk behaviour).
 ///
 /// Only [`Serialize`] is derived: the [`model`](SessionOptions::model) and
 /// [`thinking`](SessionOptions::thinking) fields reuse the [`req`](crate::req)
@@ -174,6 +178,31 @@ impl Default for SessionOptions {
     }
 }
 
+/// One named, ordered fragment appended to the effective system prompt by the
+/// per-round composition (kernel §10: dynamic insertion / modification of the
+/// system prompt while a run is in progress).
+///
+/// Segments are held in a [`Session`] by unique `name` and re-read on every round
+/// in [`Session::build_request`], so a segment pushed, overridden, or removed
+/// *between* rounds takes effect on the next round's system message. They are
+/// layered **on top of** the base prompt (the static string passed to
+/// [`Session::new`] or whatever the [system-prompt
+/// provider](Session::set_system_provider) returns), never replacing it.
+///
+/// Ordering is deterministic and independent of `BTreeMap` key order: segments
+/// are emitted by ascending [`ordinal`](SystemSegment::ordinal), then by `name`
+/// to break ties. A caller that does not care about position can let every
+/// segment default to ordinal `0` and rely on the name tiebreaker for a stable,
+/// reproducible sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SystemSegment {
+    /// The explicit sort key. Lower ordinals are emitted first; equal ordinals
+    /// fall back to the segment `name` for a total, reproducible order.
+    ordinal: i32,
+    /// The fragment text appended to the composed system prompt.
+    text: String,
+}
+
 /// A stateful, business-agnostic agentic session over the [`req`](crate::req)
 /// client.
 ///
@@ -183,8 +212,40 @@ impl Default for SessionOptions {
 pub struct Session {
     /// The stateless client performing each HTTP round trip.
     client: Client,
-    /// The fixed system prompt prepended to every request.
+    /// The static system prompt prepended to every request, and the fallback used
+    /// when no [`system_provider`](Session::system_provider) is installed.
+    ///
+    /// It also seeds a [`SessionSnapshot`]: a provider (a live closure) cannot be
+    /// serialized, so a snapshot captures this string. A round re-reads the
+    /// effective prompt from the provider when one is set (kernel §4: the system
+    /// prompt is state on disk, re-read each step, not pinned in context).
     system: String,
+    /// An optional provider re-evaluated at the start of **every** round to
+    /// recompose the effective system prompt from its source of truth (typically a
+    /// skill file on disk).
+    ///
+    /// `None` — the default — means the prompt is the fixed
+    /// [`system`](Session::system) string, so behaviour is byte-identical to a
+    /// session without this hook. When `Some`, the closure is called once per round
+    /// (in [`Session::build_request`]) and its return value is used as the system
+    /// message for that round, so a mid-run edit to the underlying skill file
+    /// affects every subsequent round (kernel §4, SSOT = disk, re-read per step).
+    /// Only `Send` is required (a session is moved onto its own slave thread, never
+    /// shared), and the provider is never part of a [`SessionSnapshot`].
+    system_provider: Option<Box<dyn Fn() -> String + Send>>,
+    /// Named, dynamically managed system-prompt segments layered on top of the
+    /// base prompt (kernel §10). Keyed by unique segment name; each round's
+    /// [`build_request`](Session::build_request) re-reads this map and appends the
+    /// segments — ordered by [`SystemSegment::ordinal`] then name — after the base
+    /// prompt. A segment inserted, overridden, or removed between rounds therefore
+    /// changes only subsequent rounds' system message, exactly like an edit to the
+    /// on-disk skill behind a [provider](Session::set_system_provider).
+    ///
+    /// Empty by default, so a session with no segments composes a system message
+    /// byte-identical to one before G9 existed. Never part of a
+    /// [`SessionSnapshot`] (the layering is a live runtime concern; a restored
+    /// session re-installs whatever segments it needs).
+    system_segments: BTreeMap<String, SystemSegment>,
     /// The running conversation history. Assistant turns are back-filled via
     /// [`RespMessage::to_history`](crate::req::RespMessage::to_history), which
     /// strips `reasoning_content`.
@@ -221,7 +282,18 @@ pub struct Session {
     /// never part of a [`SessionSnapshot`]. A `Vcs` wraps a non-`Sync`
     /// [`git2::Repository`](git2::Repository), but each session (and thus each
     /// slave thread) owns its own handle, so nothing is shared across threads.
+    ///
+    /// When a [`coordinator`](Session::coordinator) is attached, this fallback
+    /// `Vcs` is **not** opened: edits and commits go through the coordinator's
+    /// single shared handle instead.
     vcs: Option<Vcs>,
+    /// The shared transaction coordinator (kernel §6), when the
+    /// [`engine`](crate::engine) installed one. A master and all of its slaves
+    /// share a single `Arc<Coordinator>`, so every mutating edit across every
+    /// thread funnels through one operation-level lock table and one [`Vcs`]. When
+    /// set, the session attaches it to each [`ToolCtx`] and skips opening its own
+    /// per-session `Vcs`. Never part of a [`SessionSnapshot`].
+    coordinator: Option<Arc<Coordinator>>,
     /// The push-based observability sink. Defaults to [`NullSink`] (every event
     /// discarded), so observability is transparent to callers that never install
     /// a real sink — the v0 offline tests are unaffected. The
@@ -273,6 +345,8 @@ impl Session {
         Session {
             client,
             system: system.into(),
+            system_provider: None,
+            system_segments: BTreeMap::new(),
             history: Vec::new(),
             tools,
             usage: UsageTotals::default(),
@@ -281,10 +355,216 @@ impl Session {
             writer: WriterId::Human,
             workspace: None,
             vcs: None,
+            coordinator: None,
             events: Arc::new(NullSink),
             role: "session".to_string(),
             round: 0,
         }
+    }
+
+    /// Installs the shared transaction [`Coordinator`] (kernel §6) every mutating
+    /// edit routes through, returning the session for chaining.
+    ///
+    /// The [`engine`](crate::engine) layer calls this so a master and all of its
+    /// slaves share one coordinator: locking becomes implicit per edit, and the
+    /// single commit path is owned by the coordinator's exclusive [`Vcs`]. When a
+    /// coordinator is set, the session does not open its own per-session `Vcs` for
+    /// committing; the history / diff / undo tools read through the coordinator's
+    /// handle. It affects only the `tool_calls` branch of a round.
+    pub fn set_coordinator(&mut self, coordinator: Arc<Coordinator>) -> &mut Self {
+        self.coordinator = Some(coordinator);
+        self
+    }
+
+    /// Installs a **system-prompt provider** that is re-evaluated at the start of
+    /// every round, so the effective system prompt is recomposed from its source of
+    /// truth (typically a skill file on disk) instead of being pinned once at
+    /// construction.
+    ///
+    /// This realizes kernel §4: the system prompt — like the article and the skill
+    /// — is state on disk read fresh each step, not frozen into the model's
+    /// context. A mid-run edit to the underlying file therefore takes effect on the
+    /// next round. The [`engine`](crate::engine) installs a provider that re-reads
+    /// the chosen [`Skill`](crate::skill::Skill) and recomposes the slave prompt
+    /// each round.
+    ///
+    /// Without a provider (the default) the prompt is the fixed string passed to
+    /// [`Session::new`], so existing behaviour is byte-identical. The provider is a
+    /// live closure and is never captured by a [`SessionSnapshot`]; a snapshot
+    /// records the static [`system`](Session::system) string instead. Returns the
+    /// session for chaining.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use ai_write::session::{Session, SessionOptions};
+    /// use ai_write::tool::ToolRegistry;
+    /// use ai_write::req::blocking::Client;
+    ///
+    /// let client = Client::from_env()?;
+    /// let mut session = Session::new(client, "static", ToolRegistry::new(), SessionOptions::default());
+    /// let round = Arc::new(AtomicU64::new(0));
+    /// let r = Arc::clone(&round);
+    /// session.set_system_provider(move || format!("prompt for round {}", r.fetch_add(1, Ordering::SeqCst)));
+    /// assert_eq!(session.system(), "prompt for round 0");
+    /// # Ok::<(), ai_write::req::Error>(())
+    /// ```
+    pub fn set_system_provider(
+        &mut self,
+        provider: impl Fn() -> String + Send + 'static,
+    ) -> &mut Self {
+        self.system_provider = Some(Box::new(provider));
+        self
+    }
+
+    /// Inserts or overrides a named system-prompt **segment** layered on top of the
+    /// base prompt, taking effect on the **next** round (kernel §10: dynamic
+    /// insertion / modification of the system prompt while a run is in progress).
+    ///
+    /// The base prompt (the static [`system`](Session::system) string or the
+    /// [provider](Session::set_system_provider)'s output) is left untouched;
+    /// segments are appended after it in a deterministic order — ascending
+    /// `ordinal`, then `name` to break ties — and joined with a blank line. Calling
+    /// this with a `name` that already exists **overrides** that segment in place,
+    /// keeping its position determined by the new `ordinal`; calling it with a new
+    /// `name` inserts a new segment.
+    ///
+    /// Because the effective prompt is recomposed each round (when the next round's
+    /// request is assembled), a segment pushed or overridden
+    /// between rounds appears in every subsequent round's system message but does
+    /// not retroactively alter rounds already sent — mirroring kernel §4's
+    /// re-read-from-disk semantics for the base prompt. Returns the session for
+    /// chaining.
+    ///
+    /// Segments are a live runtime concern and are **not** captured by a
+    /// [`SessionSnapshot`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ai_write::session::{Session, SessionOptions};
+    /// use ai_write::tool::ToolRegistry;
+    /// use ai_write::req::blocking::Client;
+    ///
+    /// let client = Client::from_env()?;
+    /// let mut session = Session::new(client, "base prompt", ToolRegistry::new(), SessionOptions::default());
+    /// // Insert a high-priority constraint that the next round will see.
+    /// session.push_system_segment("style", -10, "Write in plain, concrete language.");
+    /// assert!(session.system().contains("Write in plain, concrete language."));
+    /// // Overriding the same name replaces its text in place.
+    /// session.push_system_segment("style", -10, "Write tersely.");
+    /// assert!(session.system().contains("Write tersely."));
+    /// assert!(!session.system().contains("plain, concrete"));
+    /// # Ok::<(), ai_write::req::Error>(())
+    /// ```
+    pub fn push_system_segment(
+        &mut self,
+        name: impl Into<String>,
+        ordinal: i32,
+        text: impl Into<String>,
+    ) -> &mut Self {
+        self.system_segments.insert(
+            name.into(),
+            SystemSegment {
+                ordinal,
+                text: text.into(),
+            },
+        );
+        self
+    }
+
+    /// Removes the named system-prompt [segment](Session::push_system_segment),
+    /// returning `true` if a segment by that `name` was present (and thus removed).
+    ///
+    /// Like an insert or override, removal takes effect on the **next** round: the
+    /// segment disappears from every subsequent round's composed system message.
+    /// Removing a name that is not present is a no-op and returns `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ai_write::session::{Session, SessionOptions};
+    /// use ai_write::tool::ToolRegistry;
+    /// use ai_write::req::blocking::Client;
+    ///
+    /// let client = Client::from_env()?;
+    /// let mut session = Session::new(client, "base", ToolRegistry::new(), SessionOptions::default());
+    /// session.push_system_segment("note", 0, "Temporary note.");
+    /// assert!(session.remove_system_segment("note"));
+    /// assert!(!session.remove_system_segment("note")); // already gone
+    /// assert_eq!(session.system(), "base");
+    /// # Ok::<(), ai_write::req::Error>(())
+    /// ```
+    pub fn remove_system_segment(&mut self, name: &str) -> bool {
+        self.system_segments.remove(name).is_some()
+    }
+
+    /// Returns the names of the currently installed system-prompt
+    /// [segments](Session::push_system_segment), in the same deterministic order
+    /// they are appended to the system message (ascending ordinal, then name).
+    ///
+    /// Useful for inspection and tests; the empty slice means no segments are
+    /// layered and the effective prompt equals the base prompt.
+    pub fn system_segment_names(&self) -> Vec<&str> {
+        let mut by_name: Vec<(&str, &SystemSegment)> = self
+            .system_segments
+            .iter()
+            .map(|(n, s)| (n.as_str(), s))
+            .collect();
+        // Stable sort by ordinal; `BTreeMap::iter` already yields name order, so
+        // equal ordinals keep their name-sorted positions.
+        by_name.sort_by_key(|(_, s)| s.ordinal);
+        by_name.into_iter().map(|(n, _)| n).collect()
+    }
+
+    /// Returns the **base** system prompt for the current round: the value of the
+    /// installed [provider](Session::set_system_provider) if any, otherwise the
+    /// fixed [`system`](Session::system) string.
+    ///
+    /// When a provider is installed this re-evaluates it, so it reflects whatever
+    /// the source of truth (e.g. a skill file) currently holds. The dynamic
+    /// [segments](Session::push_system_segment) are *not* included here; they are
+    /// layered on by [`effective_system`](Session::effective_system).
+    fn base_system(&self) -> String {
+        match &self.system_provider {
+            Some(provider) => provider(),
+            None => self.system.clone(),
+        }
+    }
+
+    /// Returns the effective system prompt for the **current** round: the
+    /// [base prompt](Session::base_system) with every dynamic
+    /// [segment](Session::push_system_segment) appended in deterministic order.
+    ///
+    /// Composition is recomputed on every call (and thus every round, since
+    /// [`build_request`](Session::build_request) calls it), so a provider
+    /// re-evaluation or a mid-run segment edit is reflected immediately. Segments
+    /// are ordered by ascending [`ordinal`](SystemSegment::ordinal) then by name,
+    /// and joined to the base — and to one another — with a blank line. With no
+    /// segments the result equals the base prompt exactly, so behaviour is
+    /// unchanged from before G9.
+    fn effective_system(&self) -> String {
+        let base = self.base_system();
+        if self.system_segments.is_empty() {
+            return base;
+        }
+        // Deterministic order: ascending ordinal, then name as the tiebreaker.
+        // `BTreeMap` already iterates by name; a stable sort by ordinal therefore
+        // yields (ordinal, name) lexicographic order without disturbing equal-ordinal
+        // ties, which stay in name order.
+        let mut ordered: Vec<&SystemSegment> = self.system_segments.values().collect();
+        ordered.sort_by_key(|seg| seg.ordinal);
+
+        let mut out = base;
+        for seg in ordered {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&seg.text);
+        }
+        out
     }
 
     /// Sets the filesystem root and writer identity used to build a
@@ -365,7 +645,7 @@ impl Session {
         if self.round == 1 {
             self.events.emit(Event::SessionStarted {
                 role: self.role.clone(),
-                system_excerpt: system_excerpt(&self.system),
+                system_excerpt: system_excerpt(&self.effective_system()),
             });
         }
         self.events.emit(Event::RoundStarted { round: self.round });
@@ -488,9 +768,15 @@ impl Session {
         &self.history
     }
 
-    /// Returns the fixed system prompt.
-    pub fn system(&self) -> &str {
-        &self.system
+    /// Returns the effective system prompt for the current round.
+    ///
+    /// When a [system-prompt provider](Session::set_system_provider) is installed,
+    /// this re-evaluates it and returns the freshly composed prompt (so it reflects
+    /// the current on-disk state, per kernel §4); otherwise it returns the fixed
+    /// string passed to [`Session::new`]. The return is owned because a provider
+    /// produces a new `String` each call.
+    pub fn system(&self) -> String {
+        self.effective_system()
     }
 
     /// Captures a serializable snapshot of the session's persistent state
@@ -498,7 +784,11 @@ impl Session {
     ///
     /// The live [`Client`] and
     /// [`ToolRegistry`] are **not** captured; restore
-    /// them with [`Session::restore`].
+    /// them with [`Session::restore`]. A
+    /// [system-prompt provider](Session::set_system_provider) is a live closure and
+    /// is likewise not captured: the snapshot records the static
+    /// [`system`](Session::system) string, and a restored session re-installs its
+    /// provider (e.g. via the engine) if it needs one.
     pub fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             system: self.system.clone(),
@@ -519,6 +809,8 @@ impl Session {
         Session {
             client,
             system: snapshot.system,
+            system_provider: None,
+            system_segments: BTreeMap::new(),
             history: snapshot.history,
             tools,
             usage: snapshot.usage,
@@ -527,6 +819,7 @@ impl Session {
             writer: WriterId::Human,
             workspace: None,
             vcs: None,
+            coordinator: None,
             events: Arc::new(NullSink),
             role: "session".to_string(),
             round: 0,
@@ -537,10 +830,14 @@ impl Session {
     /// every registered tool.
     ///
     /// The system prompt is always the first message; the running history follows.
-    /// Tools are attached (with `tool_choice = auto`) only when the registry is
-    /// non-empty, so a tool-free session sends no `tools` array.
+    /// When a [system-prompt provider](Session::set_system_provider) is installed it
+    /// is evaluated here, so every round re-reads the effective prompt from its
+    /// source of truth (kernel §4). Tools are attached (with `tool_choice = auto`)
+    /// only when the registry is non-empty, so a tool-free session sends no `tools`
+    /// array.
     fn build_request(&self) -> crate::req::Result<ChatRequest> {
-        let mut builder = ChatRequest::builder(self.options.model).system(self.system.clone());
+        let mut builder =
+            ChatRequest::builder(self.options.model.clone()).system(self.effective_system());
         for message in &self.history {
             builder = builder.message(message.clone());
         }
@@ -620,12 +917,15 @@ impl Session {
         }
 
         // Open the version-control handle once, at the same root, alongside the
-        // workspace. A failure here is non-fatal: edits still write to disk
-        // through the workspace, they just are not committed (and the history /
-        // diff / undo tools then report version control as disabled). This keeps
-        // the "guard rails in the tools, recovery in the model" contract — a
-        // missing git repository never aborts a writing session.
-        if self.vcs.is_none()
+        // workspace — unless a coordinator is installed, in which case committing
+        // (and the implicit per-edit lock) is the coordinator's job and this
+        // per-session `Vcs` is never used. A failure here is non-fatal: edits
+        // still write to disk through the workspace, they just are not committed
+        // (and the history / diff / undo tools then report version control as
+        // disabled). This keeps the "guard rails in the tools, recovery in the
+        // model" contract — a missing git repository never aborts a session.
+        if self.coordinator.is_none()
+            && self.vcs.is_none()
             && let Some(ws) = self.workspace.as_ref()
             && let Ok(vcs) = Vcs::open_or_init(ws.root())
         {
@@ -650,7 +950,11 @@ impl Session {
                 // Borrow the two workspace handles disjointly (different fields).
                 let ws = self.workspace.as_mut().expect("workspace opened above");
                 let mut ctx = ToolCtx::new(ws, writer.clone());
-                if let Some(vcs) = self.vcs.as_ref() {
+                // A coordinator, when present, owns committing and the implicit
+                // per-edit lock; otherwise fall back to the per-session `Vcs`.
+                if let Some(coord) = self.coordinator.as_ref() {
+                    ctx = ctx.with_coordinator(Arc::clone(coord));
+                } else if let Some(vcs) = self.vcs.as_ref() {
                     ctx = ctx.with_vcs(vcs);
                 }
                 self.tools.dispatch(&call.function, &mut ctx)
@@ -776,7 +1080,8 @@ fn committed_edit(value: &serde_json::Value) -> Option<(String, String)> {
 /// live [`Session`] is done by [`Session::restore`].
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSnapshot {
-    /// The fixed system prompt.
+    /// The static system prompt (the fixed string passed to [`Session::new`]). A
+    /// live [system-prompt provider](Session::set_system_provider) is not captured.
     pub system: String,
     /// The full conversation history at snapshot time.
     pub history: Vec<Message>,
@@ -1077,6 +1382,10 @@ mod tests {
             Event::SlaveSpawned { .. } => "SlaveSpawned",
             Event::SlaveReported { .. } => "SlaveReported",
             Event::Finished { .. } => "Finished",
+            Event::TxnAcquired { .. } => "TxnAcquired",
+            Event::TxnQueued { .. } => "TxnQueued",
+            Event::TxnReleased { .. } => "TxnReleased",
+            Event::HandoffToHuman { .. } => "HandoffToHuman",
         }
     }
 
@@ -1274,5 +1583,309 @@ mod tests {
             Step::Done(text) => assert_eq!(text, "all done"),
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    // --- G8: system-prompt provider re-evaluated per round (kernel §4) ---
+
+    /// Spawns a loopback HTTP server that, like [`spawn_fake_api`], replies with the
+    /// next canned `body` per request — but also **records each request body** into
+    /// the returned shared buffer, so a test can inspect what the session actually
+    /// sent (notably the `system` message) on each round.
+    fn spawn_recording_api(bodies: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&recorded);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                let mut body_start = 0usize;
+                let mut content_len = 0usize;
+                loop {
+                    let n = stream.read(&mut buf).expect("read request");
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&data);
+                    if let Some(headers_end) = text.find("\r\n\r\n") {
+                        let header_block = &text[..headers_end];
+                        content_len = header_block
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.to_ascii_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        body_start = headers_end + 4;
+                        if data.len() - body_start >= content_len {
+                            break;
+                        }
+                    }
+                }
+                // Record the request body (the JSON ChatRequest) for inspection.
+                let req_body = String::from_utf8_lossy(&data[body_start..body_start + content_len])
+                    .to_string();
+                sink.lock().expect("not poisoned").push(req_body);
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.as_bytes().len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).expect("write resp");
+                stream.flush().ok();
+            }
+        });
+        (base, recorded)
+    }
+
+    /// Extracts the `system` message content from a recorded JSON ChatRequest body
+    /// (the first message whose `role` is `"system"`).
+    fn system_of(request_body: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(request_body).expect("request is JSON");
+        v.get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|msgs| {
+                msgs.iter()
+                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+            })
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .expect("a system message with string content")
+            .to_string()
+    }
+
+    #[test]
+    fn no_provider_is_byte_identical_to_fixed_prompt() {
+        // With no provider installed, the request carries the exact fixed prompt.
+        let (base, recorded) = spawn_recording_api(vec![stop_response()]);
+        let mut session = Session::new(
+            fake_client(base),
+            "the fixed system prompt",
+            ToolRegistry::new(),
+            SessionOptions::default(),
+        );
+        session.push_user("go");
+        let _ = session.run_round();
+
+        let bodies = recorded.lock().expect("not poisoned");
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(system_of(&bodies[0]), "the fixed system prompt");
+        // And the accessor reflects the same fixed prompt.
+        assert_eq!(session.system(), "the fixed system prompt");
+    }
+
+    #[test]
+    fn provider_is_reevaluated_each_round_and_changes_the_system_message() {
+        // A provider backed by mutable shared state: each round it returns the
+        // *current* value, simulating a skill file edited between rounds. Two rounds
+        // (echo then stop) let us inspect the system message sent on each.
+        let (base, recorded) = spawn_recording_api(vec![tool_call_response(), stop_response()]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let mut session = Session::new(
+            fake_client(base),
+            "ignored static fallback",
+            registry,
+            SessionOptions::default(),
+        );
+
+        // The provider reads `current`, which a "human" edits between rounds.
+        let current: Arc<Mutex<String>> = Arc::new(Mutex::new("PROMPT v1".to_string()));
+        let provider_state = Arc::clone(&current);
+        session.set_system_provider(move || provider_state.lock().expect("not poisoned").clone());
+
+        session.push_user("do the thing");
+
+        // Round 1: the model calls `echo`; the system message must be v1.
+        let step1 = session.run_round();
+        assert!(matches!(step1, Step::Tool(_)), "round 1 dispatches echo");
+
+        // A "human" edits the underlying source between rounds (kernel §4: SSOT on
+        // disk, re-read each step).
+        *current.lock().expect("not poisoned") = "PROMPT v2 (edited mid-run)".to_string();
+
+        // Round 2: the model stops; the system message must now reflect the edit.
+        let step2 = session.run_round();
+        assert!(matches!(step2, Step::Done(_)), "round 2 finishes");
+
+        let bodies = recorded.lock().expect("not poisoned");
+        assert_eq!(bodies.len(), 2, "two requests were sent");
+        let sys1 = system_of(&bodies[0]);
+        let sys2 = system_of(&bodies[1]);
+        assert_eq!(sys1, "PROMPT v1");
+        assert_eq!(sys2, "PROMPT v2 (edited mid-run)");
+        assert_ne!(
+            sys1, sys2,
+            "editing the source between rounds must change the next round's system message"
+        );
+    }
+
+    // --- G9: dynamic system-prompt segments (kernel §10) ---
+
+    #[test]
+    fn no_segments_compose_to_the_base_prompt_exactly() {
+        // With no segments installed, the effective prompt is byte-identical to the
+        // base — G9 is fully transparent until a segment is pushed.
+        let s = Session::new(
+            test_client(),
+            "base only",
+            ToolRegistry::new(),
+            SessionOptions::default(),
+        );
+        assert!(s.system_segment_names().is_empty());
+        assert_eq!(s.system(), "base only");
+    }
+
+    #[test]
+    fn pushing_a_segment_appends_it_after_the_base() {
+        let mut s = Session::new(
+            test_client(),
+            "BASE",
+            ToolRegistry::new(),
+            SessionOptions::default(),
+        );
+        s.push_system_segment("rules", 0, "Be terse.");
+        assert_eq!(s.system(), "BASE\n\nBe terse.");
+        assert_eq!(s.system_segment_names(), ["rules"]);
+    }
+
+    #[test]
+    fn segments_are_ordered_by_ordinal_then_name() {
+        let mut s = Session::new(
+            test_client(),
+            "BASE",
+            ToolRegistry::new(),
+            SessionOptions::default(),
+        );
+        // Insert out of order; composition must be deterministic by (ordinal, name).
+        s.push_system_segment("zeta", 0, "Z"); // ordinal 0, name "zeta"
+        s.push_system_segment("alpha", 0, "A"); // ordinal 0, name "alpha" -> before zeta
+        s.push_system_segment("high", -5, "H"); // lowest ordinal -> first
+        s.push_system_segment("low", 10, "L"); // highest ordinal -> last
+
+        assert_eq!(s.system_segment_names(), ["high", "alpha", "zeta", "low"]);
+        assert_eq!(s.system(), "BASE\n\nH\n\nA\n\nZ\n\nL");
+    }
+
+    #[test]
+    fn pushing_same_name_overrides_in_place() {
+        let mut s = Session::new(
+            test_client(),
+            "BASE",
+            ToolRegistry::new(),
+            SessionOptions::default(),
+        );
+        s.push_system_segment("style", -10, "Write in plain language.");
+        assert!(s.system().contains("Write in plain language."));
+
+        // Override the same name: replaces text, no duplicate segment.
+        s.push_system_segment("style", -10, "Write tersely.");
+        assert_eq!(s.system_segment_names(), ["style"]);
+        assert!(s.system().contains("Write tersely."));
+        assert!(!s.system().contains("plain language"));
+    }
+
+    #[test]
+    fn removing_a_segment_drops_it_and_reports_presence() {
+        let mut s = Session::new(
+            test_client(),
+            "BASE",
+            ToolRegistry::new(),
+            SessionOptions::default(),
+        );
+        s.push_system_segment("note", 0, "Temporary.");
+        assert_eq!(s.system(), "BASE\n\nTemporary.");
+
+        assert!(s.remove_system_segment("note"), "present -> removed");
+        assert!(
+            !s.remove_system_segment("note"),
+            "already gone -> no-op false"
+        );
+        assert_eq!(s.system(), "BASE");
+        assert!(s.system_segment_names().is_empty());
+    }
+
+    #[test]
+    fn segments_compose_on_top_of_a_provider_base() {
+        // Segments layer on whatever the provider currently returns, not the static
+        // fallback — so a provider edit and a segment edit are independent.
+        let mut s = Session::new(
+            test_client(),
+            "static fallback (ignored)",
+            ToolRegistry::new(),
+            SessionOptions::default(),
+        );
+        let base = Arc::new(Mutex::new("PROVIDER v1".to_string()));
+        let b = Arc::clone(&base);
+        s.set_system_provider(move || b.lock().expect("not poisoned").clone());
+        s.push_system_segment("seg", 0, "SEG");
+
+        assert_eq!(s.system(), "PROVIDER v1\n\nSEG");
+        // Editing the provider source moves the base but keeps the segment.
+        *base.lock().expect("not poisoned") = "PROVIDER v2".to_string();
+        assert_eq!(s.system(), "PROVIDER v2\n\nSEG");
+    }
+
+    #[test]
+    fn segment_inserted_mid_run_appears_in_subsequent_rounds_only() {
+        // Three rounds: echo, echo, stop. We inspect the system message the session
+        // actually sent each round to assert insert/override/remove all take effect
+        // on the *next* round, never retroactively.
+        let (base, recorded) = spawn_recording_api(vec![
+            tool_call_response(),
+            tool_call_response(),
+            stop_response(),
+        ]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let mut session = Session::new(
+            fake_client(base),
+            "BASE",
+            registry,
+            SessionOptions::default(),
+        );
+        session.push_user("go");
+
+        // Round 1: no segments yet -> just the base.
+        let step1 = session.run_round();
+        assert!(matches!(step1, Step::Tool(_)));
+
+        // Insert a segment between round 1 and round 2.
+        session.push_system_segment("rule", 0, "RULE-A");
+
+        // Round 2: the segment must now be present.
+        let step2 = session.run_round();
+        assert!(matches!(step2, Step::Tool(_)));
+
+        // Override the segment and add a second one, then remove the override-less one.
+        session.push_system_segment("rule", 0, "RULE-B");
+        session.push_system_segment("extra", -1, "EXTRA");
+        // Remove a non-existent name to confirm it does not disturb the rest.
+        assert!(!session.remove_system_segment("nope"));
+
+        // Round 3: base + reordered (extra has lower ordinal) + overridden text.
+        let step3 = session.run_round();
+        assert!(matches!(step3, Step::Done(_)));
+
+        let bodies = recorded.lock().expect("not poisoned");
+        assert_eq!(bodies.len(), 3, "three requests were sent");
+        assert_eq!(system_of(&bodies[0]), "BASE", "round 1: base only");
+        assert_eq!(
+            system_of(&bodies[1]),
+            "BASE\n\nRULE-A",
+            "round 2: segment inserted mid-run is now present"
+        );
+        assert_eq!(
+            system_of(&bodies[2]),
+            "BASE\n\nEXTRA\n\nRULE-B",
+            "round 3: override + reorder by ordinal take effect"
+        );
     }
 }

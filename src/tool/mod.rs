@@ -35,8 +35,11 @@
 pub mod tools;
 pub mod workspace;
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
+use crate::coordinator::Coordinator;
 use crate::req::FunctionCall;
 use crate::vcs::Vcs;
 use workspace::{Workspace, WriterId};
@@ -93,45 +96,74 @@ pub enum ToolError {
 /// The mutable context handed to a [`Tool`] for the duration of one call.
 ///
 /// It bundles the workspace the tool operates on with the identity of the writer
-/// performing the call, so lock-guarded tools can check and record ownership, and
-/// optionally a [`Vcs`] handle so a successful content edit is recorded as a git
-/// commit.
+/// performing the call, and optionally a [`Vcs`] handle and a shared
+/// [`Coordinator`].
 ///
-/// # Version control
+/// # Coordinator-routed edits (kernel §6)
 ///
-/// The [`vcs`](ToolCtx::vcs) handle is **optional**. When present (the
-/// [`session`](crate::session) layer attaches one rooted at the workspace), the
-/// lock-guarded editors ([`WriteArticle`](tools::WriteArticle),
-/// [`EditArticle`](tools::EditArticle), [`ApplyEdits`](tools::ApplyEdits)) call
-/// [`ToolCtx::commit_article`] after a successful write, turning each edit into a
-/// commit authored by [`writer`](ToolCtx::writer); the history / diff / undo tools
-/// read or mutate through it. When absent (the workspace-only unit tests), the
-/// editors behave exactly as in v0 — they write to disk and skip the commit — so
-/// the tool layer is usable without a git repository.
+/// The [`coord`](ToolCtx::coord) handle is **optional**. When present (the
+/// [`engine`](crate::engine) layer attaches one shared by the master and every
+/// slave), the article editors ([`WriteArticle`](tools::WriteArticle),
+/// [`EditArticle`](tools::EditArticle), [`ApplyEdits`](tools::ApplyEdits)) route
+/// each edit through [`Coordinator::submit`] as a single-file transaction whose
+/// declared lock set is `{ <theme>/<file>, <theme>/index.json }`. The coordinator
+/// owns the operation-level lock and the one [`Vcs`], so locking is implicit per
+/// edit and the body **and** the theme manifest land in **one** commit (one
+/// cognitive unit = one commit). The model never acquires or releases locks.
+///
+/// # Version control without a coordinator
+///
+/// The [`vcs`](ToolCtx::vcs) handle is also optional. When a coordinator is
+/// **absent** but a `Vcs` is present, the editors fall back to writing through the
+/// workspace and committing via [`ToolCtx::commit_article`] (body + index in one
+/// commit). When **both** are absent (the workspace-only unit tests) the editors
+/// write to disk and skip the commit, so the tool layer is usable without a git
+/// repository. The history / diff tools read through whichever of the coordinator
+/// or the `Vcs` is attached.
 pub struct ToolCtx<'a> {
-    /// The workspace rooted at the theme directory tree.
+    /// The workspace rooted at the theme directory tree. Used by read / structure
+    /// tools; with a coordinator attached, mutating edits go through the
+    /// coordinator's own workspace instead.
     pub ws: &'a mut Workspace,
-    /// The identity of the writer issuing this call (used by lock-guarded tools
-    /// and as the git author of any commit produced by the call).
+    /// The identity of the writer issuing this call (the scheduling priority and
+    /// the git author of any commit produced by the call).
     pub writer: WriterId,
-    /// The workspace's version-control handle, when version control is enabled.
-    /// `None` disables committing (and the history/diff/undo tools error with
-    /// [`ToolError::Vcs`]).
+    /// The workspace's version-control handle, when version control is enabled
+    /// without a coordinator. `None` disables direct committing.
     pub vcs: Option<&'a Vcs>,
+    /// The shared transaction coordinator, when the engine attached one. When
+    /// present, article edits are submitted as coordinator transactions and the
+    /// history / diff tools read through the coordinator's exclusive [`Vcs`].
+    pub coord: Option<Arc<Coordinator>>,
 }
 
 impl<'a> ToolCtx<'a> {
     /// Creates a tool context binding a workspace to a writer identity, with no
-    /// version control attached.
+    /// version control or coordinator attached.
     ///
     /// Use [`ToolCtx::with_vcs`] to attach a [`Vcs`] so successful edits are
-    /// committed.
+    /// committed directly, or [`ToolCtx::with_coordinator`] to route edits through
+    /// the shared transaction coordinator.
     pub fn new(ws: &'a mut Workspace, writer: WriterId) -> Self {
         ToolCtx {
             ws,
             writer,
             vcs: None,
+            coord: None,
         }
+    }
+
+    /// Attaches a shared [`Coordinator`] to this context, so article edits are
+    /// submitted as coordinator transactions and the version-control tools read
+    /// through the coordinator's exclusive [`Vcs`]. Returns the context for
+    /// chaining.
+    ///
+    /// When a coordinator is attached it takes precedence over any [`Vcs`] set
+    /// with [`ToolCtx::with_vcs`]: the coordinator owns the canonical lock state
+    /// and the single commit path.
+    pub fn with_coordinator(mut self, coord: Arc<Coordinator>) -> Self {
+        self.coord = Some(coord);
+        self
     }
 
     /// Attaches a [`Vcs`] handle to this context, enabling per-edit commits and
@@ -157,17 +189,16 @@ impl<'a> ToolCtx<'a> {
         self
     }
 
-    /// Commits an article and its theme index to version control after a
-    /// successful edit, attributing the commit to [`writer`](ToolCtx::writer).
+    /// Commits an article **and** its theme index to version control as **one**
+    /// commit after a successful edit, attributing it to [`writer`](ToolCtx::writer).
     ///
-    /// This is a no-op (returning `Ok(())`) when no [`Vcs`] is attached, so the
-    /// lock-guarded editors can call it unconditionally. When a `Vcs` is present
-    /// it produces **two** commits — one for the article file
-    /// (`<theme>/<file_name>`), then one for the theme index
-    /// (`<theme>/index.json`) — matching the version-control module's "one call,
-    /// one commit" granularity and ensuring the reading-order / provenance index
-    /// stays versioned alongside the content. The index commit is skipped when the
-    /// theme has no `index.json` on disk yet.
+    /// This is the no-coordinator fallback path: a no-op (returning `Ok(None)`)
+    /// when no [`Vcs`] is attached, so the editors can call it unconditionally.
+    /// When a `Vcs` is present it folds the article file (`<theme>/<file_name>`)
+    /// and the theme index (`<theme>/index.json`) into a **single**
+    /// [`Vcs::commit_paths`] commit — one cognitive unit is one commit
+    /// (`docs/coordinator-design.md` §5), replacing the earlier two-commit
+    /// granularity. The index is included only when it exists on disk.
     ///
     /// The edit has already been written to disk by the time this is called, so a
     /// version-control failure does not lose content; it is surfaced as
@@ -175,7 +206,7 @@ impl<'a> ToolCtx<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Vcs`] if staging or committing the article (or the
+    /// Returns [`ToolError::Vcs`] if staging or committing the article (plus the
     /// index) fails.
     pub fn commit_article(
         &self,
@@ -187,18 +218,91 @@ impl<'a> ToolCtx<'a> {
             return Ok(None);
         };
         let article_rel = std::path::Path::new(theme).join(file_name);
-        let sha = vcs
-            .commit_file(&article_rel, &self.writer, message)
-            .map_err(|e| ToolError::Vcs(e.to_string()))?;
-
-        // Version the theme index too, as its own commit, when it exists on disk.
         let index_rel = std::path::Path::new(theme).join("index.json");
+
+        // One commit covering the body and (when present) the manifest.
+        let mut paths: Vec<&std::path::Path> = vec![article_rel.as_path()];
         if self.ws.root().join(&index_rel).exists() {
-            let index_msg = format!("index({theme}): record edit to {file_name}");
-            vcs.commit_file(&index_rel, &self.writer, &index_msg)
-                .map_err(|e| ToolError::Vcs(e.to_string()))?;
+            paths.push(index_rel.as_path());
         }
+        let sha = vcs
+            .commit_paths(&paths, &self.writer, message)
+            .map_err(|e| ToolError::Vcs(e.to_string()))?;
         Ok(Some(sha))
+    }
+
+    /// Persists `text` as the full new body of `<theme>/<file_name>` and records
+    /// the edit as exactly one commit, returning the commit's short SHA (or `None`
+    /// when version control is disabled).
+    ///
+    /// This is the single seam the article editors
+    /// ([`WriteArticle`](tools::WriteArticle), [`EditArticle`](tools::EditArticle),
+    /// [`ApplyEdits`](tools::ApplyEdits)) write through, so locking and committing
+    /// are uniform regardless of how the new text was computed:
+    ///
+    /// - **With a [`Coordinator`] attached**, the write is a coordinator
+    ///   transaction (kernel §6): the declared lock set is
+    ///   `{ <theme>/<file>, <theme>/index.json }`, acquired all-or-nothing, and the
+    ///   body plus manifest are committed once inside the critical section. Locking
+    ///   is implicit — the model never touches a lock.
+    /// - **Without a coordinator**, it writes through the workspace (taking the
+    ///   in-memory per-article lock the caller is expected to hold) and commits via
+    ///   [`ToolCtx::commit_article`] (body + index, one commit). This preserves the
+    ///   pre-coordinator behaviour for the workspace-only tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Lock`] if the no-coordinator path is used and the
+    /// caller does not hold the article lock, [`ToolError::NotFound`] /
+    /// [`ToolError::Unsupported`] for a workspace failure, or [`ToolError::Vcs`] if
+    /// the commit (coordinator or direct) fails.
+    pub fn commit_full_text(
+        &mut self,
+        theme: &str,
+        file_name: &str,
+        text: &str,
+        message: &str,
+    ) -> Result<Option<String>, ToolError> {
+        if let Some(coord) = self.coord.clone() {
+            use crate::coordinator::{LockSet, TxnRequest};
+            let article_rel = std::path::Path::new(theme).join(file_name);
+            let index_rel = std::path::Path::new(theme).join("index.json");
+            let locks = LockSet::new().with(&article_rel).with(&index_rel);
+            let req = TxnRequest::new(self.writer.clone(), locks, message.to_string());
+            let text = text.to_string();
+            let theme = theme.to_string();
+            let file_name = file_name.to_string();
+            let message = message.to_string();
+            let outcome = coord
+                .submit(req, move |ctx| {
+                    ctx.write_article(&theme, &file_name, &text)?;
+                    Ok(message)
+                })
+                .map_err(coord_error_to_tool)?;
+            return Ok(outcome.sha);
+        }
+
+        // No coordinator: write through the workspace (lock must be held) and
+        // commit body + index in one commit.
+        let writer = self.writer.clone();
+        self.ws.write_article(theme, file_name, text, &writer)?;
+        self.commit_article(theme, file_name, message)
+    }
+}
+
+/// Maps a [`CoordError`](crate::coordinator::CoordError) to the [`ToolError`] the
+/// model sees, so a coordinator-routed edit reports failures in the same shape as
+/// the direct path.
+fn coord_error_to_tool(err: crate::coordinator::CoordError) -> ToolError {
+    use crate::coordinator::CoordError;
+    match err {
+        CoordError::Undeclared(path) => ToolError::Other(format!(
+            "edit touched an undeclared path: {}",
+            path.display()
+        )),
+        CoordError::Workspace(e) => e,
+        CoordError::Vcs(e) => ToolError::Vcs(e.to_string()),
+        CoordError::Aborted(msg) => ToolError::Other(msg),
     }
 }
 

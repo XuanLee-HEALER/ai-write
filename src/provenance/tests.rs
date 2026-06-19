@@ -591,3 +591,141 @@ fn sequential_edits_preserve_per_char_authorship() {
         vec![&human(), &agent("y"), &agent("x")]
     );
 }
+
+// --- B2: reauthor (full-body replace preserving unchanged authorship) --------
+
+#[test]
+fn reauthor_attributes_only_the_changed_middle() {
+    // Human wrote the whole sentence; an agent hands back a full new body that
+    // only changes the middle word.
+    let mut t = RichText::from_plain("the quick brown fox", human());
+    reauthor(&mut t, "the quick red fox", &agent("a")).unwrap();
+    assert_eq!(t.plain_string(), "the quick red fox");
+    assert_eq!(
+        shape(&t),
+        vec![
+            ("the quick ".to_string(), "human".to_string()),
+            ("red".to_string(), "m/a".to_string()),
+            (" fox".to_string(), "human".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn reauthor_pure_append_keeps_prefix_authorship() {
+    // Appending at the end attributes only the appended tail to the new author.
+    let mut t = RichText::from_plain("hello", human());
+    reauthor(&mut t, "hello world", &agent("a")).unwrap();
+    assert_eq!(
+        shape(&t),
+        vec![
+            ("hello".to_string(), "human".to_string()),
+            (" world".to_string(), "m/a".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn reauthor_pure_prepend_keeps_suffix_authorship() {
+    let mut t = RichText::from_plain("world", human());
+    reauthor(&mut t, "hello world", &agent("a")).unwrap();
+    assert_eq!(
+        shape(&t),
+        vec![
+            ("hello ".to_string(), "m/a".to_string()),
+            ("world".to_string(), "human".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn reauthor_identical_body_is_a_noop() {
+    let mut t = rt(&[("ab", human()), ("cd", agent("a"))]);
+    let before = shape(&t);
+    reauthor(&mut t, "abcd", &agent("z")).unwrap();
+    // No characters changed, so authorship is untouched (agent z appears nowhere).
+    assert_eq!(shape(&t), before);
+}
+
+#[test]
+fn reauthor_full_rewrite_attributes_all_to_new_author() {
+    // A body with no common prefix or suffix is wholly re-attributed.
+    let mut t = RichText::from_plain("xyz", human());
+    reauthor(&mut t, "qrs", &agent("a")).unwrap();
+    assert_eq!(shape(&t), vec![("qrs".to_string(), "m/a".to_string())]);
+}
+
+#[test]
+fn reauthor_handles_multibyte_boundaries() {
+    // A common prefix that would otherwise land mid-character must back off to a
+    // UTF-8 boundary; the edit stays valid and authorship is preserved. Here
+    // "café " is the shared prefix and the differing tail is wholly distinct.
+    let mut t = RichText::from_plain("café crème", human());
+    reauthor(&mut t, "café mocha", &agent("a")).unwrap();
+    assert_eq!(t.plain_string(), "café mocha");
+    // "café " stays the human's; the changed tail "crème"->"mocha" is the agent's.
+    assert_eq!(t.runs[0].author, human());
+    assert_eq!(t.runs[0].text, "café ");
+    assert_eq!(t.runs[1].author, agent("a"));
+    assert_eq!(t.runs[1].text, "mocha");
+}
+
+#[test]
+fn reauthor_then_second_writer_blends_three_authors() {
+    // Human writes; agent a revises one word; human revises a different word.
+    // Each writer's contribution must survive the others' later edits.
+    let mut t = RichText::from_plain("one two three", human());
+    reauthor(&mut t, "one TWO three", &agent("a")).unwrap();
+    reauthor(&mut t, "ONE TWO three", &human()).unwrap();
+    assert_eq!(t.plain_string(), "ONE TWO three");
+    // "TWO" stays agent a's even though a human edited around it.
+    let twos: Vec<_> = t
+        .runs
+        .iter()
+        .filter(|r| r.text.contains("TWO"))
+        .map(|r| r.author.clone())
+        .collect();
+    assert_eq!(twos, vec![agent("a")]);
+}
+
+// --- B2: flatten_body / paragraph_document round-trip ------------------------
+
+#[test]
+fn flatten_then_paragraph_round_trips_single_paragraph() {
+    let body = rt(&[("hello ", human()), ("world", agent("a"))]);
+    let doc = paragraph_document(&body);
+    assert_eq!(doc.blocks.len(), 1);
+    let back = flatten_body(&doc, &human());
+    assert_eq!(back, body);
+}
+
+#[test]
+fn paragraph_document_splits_on_blank_lines_preserving_runs() {
+    // A body spanning two paragraphs with a run crossing the blank-line boundary.
+    let body = rt(&[("para one\n\npar", human()), ("a two", agent("a"))]);
+    let doc = paragraph_document(&body);
+    assert_eq!(doc.blocks.len(), 2);
+    // First paragraph is wholly the human's.
+    match &doc.blocks[0] {
+        Block::Paragraph(t) => assert_eq!(t.plain_string(), "para one"),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+    // Second paragraph keeps the author split at the run boundary.
+    match &doc.blocks[1] {
+        Block::Paragraph(t) => {
+            assert_eq!(t.plain_string(), "para two");
+            assert_eq!(t.runs[0].author, human()); // "par"
+            assert_eq!(t.runs[1].author, agent("a")); // "a two"
+        }
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+    // Re-flattening reproduces the original authored body.
+    assert_eq!(flatten_body(&doc, &human()), body);
+}
+
+#[test]
+fn paragraph_document_of_empty_body_is_empty() {
+    let doc = paragraph_document(&RichText::empty());
+    assert!(doc.blocks.is_empty());
+    assert_eq!(flatten_body(&doc, &human()), RichText::empty());
+}

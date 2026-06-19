@@ -11,10 +11,13 @@
 //!
 //! - [`Vcs::open_or_init`] adopts an existing repository at the workspace root,
 //!   or runs the equivalent of `git init` if there is no `.git` directory yet.
-//! - [`Vcs::commit_file`] stages **only** the named file (plus, when relevant,
-//!   the theme index file the caller passes in a separate call) and creates one
-//!   commit. It never stages the whole tree (`add -A`), so concurrent edits to
-//!   *other* articles never leak into an unrelated commit.
+//! - [`Vcs::commit_paths`] stages **only** the named paths and creates **one**
+//!   commit covering all of them — the primitive behind "one cognitive unit =
+//!   one commit" (`docs/coordinator-design.md` §5): an article plus its theme
+//!   index file are versioned together in a single atomic commit.
+//!   [`Vcs::commit_file`] is the one-path convenience wrapper. Neither stages the
+//!   whole tree (`add -A`), so concurrent edits to *other* articles never leak
+//!   into an unrelated commit.
 //! - [`Vcs::history`] lists the commits that touched one file, newest first.
 //! - [`Vcs::diff`] renders a unified patch for one file between two revisions
 //!   (or against the working tree / the empty tree, when an endpoint is
@@ -124,11 +127,30 @@ pub struct CommitInfo {
     pub time: i64,
 }
 
+/// A single line's authorship, as returned by [`Vcs::blame`].
+///
+/// One entry per line of the file's current committed content, giving the
+/// line-level attribution the kernel calls for (`docs/ai-write-kernel.html` §9:
+/// "`git blame` gives line-level attribution"). The fields are flattened, owned,
+/// and serializable so the WebUI layer can emit them directly as JSON.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BlameLine {
+    /// The 1-based line number within the file.
+    pub line_no: usize,
+    /// The author that last touched this line, rendered as `"<name> <email>"` —
+    /// the same shape as [`CommitInfo::author`], so `"human <human@…>"` for a
+    /// human edit and `"<model>/<label> <agent@…>"` for an agent edit.
+    pub author: String,
+    /// The abbreviated SHA (the first 10 hex characters) of the commit that last
+    /// touched this line.
+    pub short_sha: String,
+}
+
 /// A handle to the workspace's git repository.
 ///
 /// Construct one with [`Vcs::open_or_init`]; it owns the [`git2::Repository`]
-/// and exposes the commit / history / diff / restore operations the tool layer
-/// calls after a successful edit. See the [module docs](self) for the model.
+/// and exposes the commit / history / diff / restore / blame operations the tool
+/// layer calls after a successful edit. See the [module docs](self) for the model.
 pub struct Vcs {
     /// The underlying libgit2 repository handle, rooted at the workspace root.
     repo: Repository,
@@ -168,14 +190,103 @@ impl Vcs {
         Ok(Vcs { repo })
     }
 
+    /// Stages every path in `paths` and records them as **one** commit authored
+    /// by `author`, returning the abbreviated SHA.
+    ///
+    /// This is the atomic-commit primitive behind "one cognitive unit = one
+    /// commit" (`docs/coordinator-design.md` §5): the caller hands in every path
+    /// a single logical edit touched — an article body plus the theme index
+    /// (`index.json`) it belongs to, say — and they all land in the same commit.
+    /// Only the listed paths are added to the index; the rest of the work tree
+    /// is left untouched, so a commit never sweeps in unrelated edits.
+    ///
+    /// A path that exists in the work tree is staged with `index.add_path`, which
+    /// records its current content; a path that is **absent** from the work tree is
+    /// staged as a removal with `index.remove_path`, so a transaction that deleted
+    /// a file (a merge consuming its sources, say) records the deletion in the same
+    /// commit. After all paths are staged the index is written once and a single
+    /// tree/commit pair is produced. The commit's author and committer are both
+    /// derived from `author` (see the [module docs](self)). When the repository
+    /// already has commits, the new commit's parent is the current `HEAD`; the very
+    /// first commit is a root commit with no parents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VcsError::NoHistory`] if `paths` is empty (there is nothing to
+    /// commit), [`VcsError::NonUtf8Path`] if any path is not valid UTF-8, or
+    /// [`VcsError::Git`] if staging fails or writing the commit fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::path::Path;
+    /// # use ai_write::tool::workspace::WriterId;
+    /// # use ai_write::vcs::Vcs;
+    /// # fn main() -> Result<(), ai_write::vcs::VcsError> {
+    /// let vcs = Vcs::open_or_init(Path::new("workspace"))?;
+    /// // Version the article body and its theme index in a single commit.
+    /// let sha = vcs.commit_paths(
+    ///     &[Path::new("rust/intro.md"), Path::new("rust/index.json")],
+    ///     &WriterId::Human,
+    ///     "edit(rust/intro.md): human revision",
+    /// )?;
+    /// # let _ = sha;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn commit_paths(
+        &self,
+        paths: &[&Path],
+        author: &WriterId,
+        message: &str,
+    ) -> Result<String, VcsError> {
+        if paths.is_empty() {
+            return Err(VcsError::NoHistory(
+                "commit_paths requires at least one path".to_string(),
+            ));
+        }
+
+        let workdir = self.repo.workdir();
+        let mut index = self.repo.index()?;
+        // Stage only the named paths; nothing else is touched. A path that still
+        // exists on disk is staged with its current content; a path that has been
+        // removed from the work tree is staged as a deletion, so a transaction that
+        // deleted a file records the removal in this same commit.
+        for rel in paths {
+            let rel_str = path_str(rel)?;
+            let rel_path = Path::new(rel_str);
+            let exists = workdir.map(|w| w.join(rel_path).exists()).unwrap_or(false);
+            if exists {
+                index.add_path(rel_path)?;
+            } else if index.get_path(rel_path, 0).is_some() {
+                // Tracked but gone from disk: stage its removal. An untracked path
+                // that was created and deleted within the same transaction is
+                // simply not in the index, so there is nothing to stage.
+                index.remove_path(rel_path)?;
+            }
+        }
+        index.write()?;
+        let tree_oid = index.write_tree()?;
+        let tree = self.repo.find_tree(tree_oid)?;
+
+        let sig = signature(author)?;
+        let parents = self.head_commit_vec()?;
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        let oid = self
+            .repo
+            .commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)?;
+        Ok(short_sha(oid))
+    }
+
     /// Stages the single file `rel` and records it as one commit authored by
     /// `author`, returning the abbreviated SHA.
     ///
+    /// A convenience wrapper over [`Vcs::commit_paths`] with a one-element slice.
     /// Only `rel` is added to the index — the rest of the work tree is left
-    /// untouched, so a commit never sweeps in unrelated edits. To also version a
-    /// theme index (`index.json`) alongside the article, call `commit_file` again
-    /// for that path; each call is its own commit, matching the "one edit, one
-    /// commit" granularity (`docs/impl-v1.md` §1, decision V1).
+    /// untouched, so a commit never sweeps in unrelated edits. To version a
+    /// theme index (`index.json`) **together** with the article in one atomic
+    /// commit, use [`Vcs::commit_paths`] with both paths instead of two separate
+    /// `commit_file` calls (`docs/coordinator-design.md` §5).
     ///
     /// The commit's author and committer are both derived from `author` (see the
     /// [module docs](self)). When the repository already has commits, the new
@@ -211,22 +322,7 @@ impl Vcs {
         author: &WriterId,
         message: &str,
     ) -> Result<String, VcsError> {
-        let rel_str = path_str(rel)?;
-        let mut index = self.repo.index()?;
-        // Stage only the named path. `add_path` records the current work-tree
-        // content of exactly this file; nothing else is touched.
-        index.add_path(Path::new(rel_str))?;
-        index.write()?;
-        let tree_oid = index.write_tree()?;
-        let tree = self.repo.find_tree(tree_oid)?;
-
-        let sig = signature(author)?;
-        let parents = self.head_commit_vec()?;
-        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-        let oid = self
-            .repo
-            .commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)?;
-        Ok(short_sha(oid))
+        self.commit_paths(&[rel], author, message)
     }
 
     /// Returns the commits that touched `rel`, newest first.
@@ -453,6 +549,81 @@ impl Vcs {
         Ok(Some(sha))
     }
 
+    /// Returns the per-line authorship of `rel` as committed at `HEAD`, one
+    /// [`BlameLine`] per line, in ascending line order.
+    ///
+    /// This is the line-level provenance the kernel describes
+    /// (`docs/ai-write-kernel.html` §9): `git blame` resolves, for every line of
+    /// the file's committed content, which commit (and therefore which
+    /// [`WriterId`] — human vs a specific model snapshot) last changed it. The
+    /// blame runs against the version of `rel` at `HEAD`, not the working tree, so
+    /// uncommitted edits are not attributed; commit first to see them.
+    ///
+    /// libgit2 reports authorship in *hunks* (a run of consecutive lines sharing a
+    /// final commit); this method expands each hunk into its individual lines so
+    /// the caller gets a flat, line-indexed vector. Line numbers are 1-based. A
+    /// file that has never been committed yields an empty vector — not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VcsError::NonUtf8Path`] if `rel` is not valid UTF-8, or
+    /// [`VcsError::Git`] if the blame fails for any reason other than the file
+    /// being absent from history (for which an empty vector is returned). An empty
+    /// repository (no commits at all) also yields an empty vector.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::path::Path;
+    /// # use ai_write::vcs::Vcs;
+    /// # fn main() -> Result<(), ai_write::vcs::VcsError> {
+    /// let vcs = Vcs::open_or_init(Path::new("workspace"))?;
+    /// for line in vcs.blame(Path::new("rust/intro.md"))? {
+    ///     println!("{:>4} {} {}", line.line_no, line.short_sha, line.author);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn blame(&self, rel: &Path) -> Result<Vec<BlameLine>, VcsError> {
+        // Validate UTF-8 up front (libgit2 needs it) and short-circuit an empty
+        // repository: there is nothing committed to attribute yet.
+        let _ = path_str(rel)?;
+        if self.repo.head().is_err() {
+            return Ok(Vec::new());
+        }
+
+        let blame = match self.repo.blame_file(rel, None) {
+            Ok(blame) => blame,
+            // The file is not part of HEAD's history (never committed, or absent
+            // at this revision): no attribution, not an error.
+            Err(e) if e.code() == ErrorCode::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(VcsError::Git(e)),
+        };
+
+        let mut out = Vec::new();
+        for hunk in blame.iter() {
+            let author = hunk
+                .final_signature()
+                .map(|sig| signature_string(&sig))
+                .unwrap_or_default();
+            let short_sha = short_sha(hunk.final_commit_id());
+            let start = hunk.final_start_line();
+            // `final_start_line` is the 1-based number of the hunk's first line in
+            // the final file; expand the run into one entry per line.
+            for offset in 0..hunk.lines_in_hunk() {
+                out.push(BlameLine {
+                    line_no: start + offset,
+                    author: author.clone(),
+                    short_sha: short_sha.clone(),
+                });
+            }
+        }
+        // Hunks arrive in file order, but make the per-line ordering explicit and
+        // robust regardless of iteration order.
+        out.sort_by_key(|l| l.line_no);
+        Ok(out)
+    }
+
     // ----- Internal helpers -------------------------------------------------
 
     /// Returns the current `HEAD` commit as a single-element vector, or an empty
@@ -624,6 +795,30 @@ mod tests {
             .expect("commit");
         assert_eq!(sha.len(), SHORT_SHA_LEN);
         assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn pinned_dated_model_id_round_trips_into_commit_author() {
+        // Kernel §9: an exact dated snapshot id must survive into the git author,
+        // so the commit names the precise model that produced the text.
+        let (dir, vcs) = repo();
+        let pinned = WriterId::Agent {
+            model: "deepseek-v4-pro-2026-05-01".to_string(),
+            label: "s1".to_string(),
+        };
+        write(&dir, "t/a.md", "snapshot-authored body");
+        vcs.commit_file(Path::new("t/a.md"), &pinned, "edit(t/a.md): write")
+            .expect("commit");
+
+        let hist = vcs.history(Path::new("t/a.md")).unwrap();
+        assert_eq!(hist.len(), 1);
+        // The author line carries the pinned id verbatim, matching the writer's
+        // provenance tag (`<model>/<label>`).
+        assert_eq!(
+            hist[0].author,
+            "deepseek-v4-pro-2026-05-01/s1 <agent@ai-write.local>"
+        );
+        assert!(hist[0].author.contains(&pinned.provenance_tag()));
     }
 
     #[test]
@@ -811,6 +1006,77 @@ mod tests {
     }
 
     #[test]
+    fn commit_paths_commits_multiple_paths_as_one_commit() {
+        let (dir, vcs) = repo();
+        write(&dir, "t/a.md", "article body\n");
+        write(&dir, "t/index.json", "{\"order\":[]}\n");
+
+        let sha = vcs
+            .commit_paths(
+                &[Path::new("t/a.md"), Path::new("t/index.json")],
+                &agent("s1"),
+                "edit(t/a.md): body + index in one commit",
+            )
+            .expect("commit_paths");
+
+        // Each path's history records exactly one touching commit...
+        let hist_a = vcs.history(Path::new("t/a.md")).unwrap();
+        let hist_idx = vcs.history(Path::new("t/index.json")).unwrap();
+        assert_eq!(hist_a.len(), 1, "a.md touched by exactly one commit");
+        assert_eq!(
+            hist_idx.len(),
+            1,
+            "index.json touched by exactly one commit"
+        );
+
+        // ...and it is the *same* commit (one cognitive unit = one commit).
+        assert_eq!(hist_a[0].id, sha);
+        assert_eq!(hist_idx[0].id, sha);
+        assert_eq!(hist_a[0].id, hist_idx[0].id);
+
+        // The repository has exactly one commit in total.
+        let mut walk = vcs.repo.revwalk().unwrap();
+        walk.push_head().unwrap();
+        assert_eq!(walk.count(), 1, "exactly one new commit was created");
+    }
+
+    #[test]
+    fn commit_paths_empty_slice_is_error() {
+        let (_dir, vcs) = repo();
+        let err = vcs
+            .commit_paths(&[], &agent("s1"), "nothing to commit")
+            .unwrap_err();
+        assert!(matches!(err, VcsError::NoHistory(_)), "got: {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_paths_non_utf8_path_is_non_utf8_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_dir, vcs) = repo();
+        // 0xFF is never valid UTF-8.
+        let bad = Path::new(OsStr::from_bytes(b"t/\xff.md"));
+        let err = vcs
+            .commit_paths(&[bad], &agent("s1"), "bad path")
+            .unwrap_err();
+        assert!(matches!(err, VcsError::NonUtf8Path(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn commit_file_delegates_to_commit_paths() {
+        let (dir, vcs) = repo();
+        write(&dir, "t/a.md", "solo\n");
+        let sha = vcs
+            .commit_file(Path::new("t/a.md"), &agent("s1"), "solo edit")
+            .expect("commit_file");
+        let hist = vcs.history(Path::new("t/a.md")).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].id, sha);
+    }
+
+    #[test]
     fn first_commit_is_a_root_commit() {
         let (dir, vcs) = repo();
         write(&dir, "t/a.md", "x");
@@ -818,5 +1084,121 @@ mod tests {
             .unwrap();
         let head = vcs.repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.parent_count(), 0);
+    }
+
+    // ----- blame: per-line authorship ---------------------------------------
+
+    #[test]
+    fn blame_of_uncommitted_file_is_empty_not_error() {
+        let (_dir, vcs) = repo();
+        // Nothing committed at all: blame yields an empty vector, never an error.
+        assert!(vcs.blame(Path::new("t/a.md")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn blame_unknown_file_is_empty_not_error() {
+        let (dir, vcs) = repo();
+        write(&dir, "t/a.md", "x\n");
+        vcs.commit_file(Path::new("t/a.md"), &agent("s1"), "v1")
+            .unwrap();
+        // A path absent from HEAD's history attributes to nothing, not an error.
+        assert!(vcs.blame(Path::new("t/ghost.md")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn blame_single_commit_attributes_every_line_to_its_author() {
+        let (dir, vcs) = repo();
+        write(&dir, "t/a.md", "line one\nline two\nline three\n");
+        vcs.commit_file(Path::new("t/a.md"), &agent("s1"), "v1")
+            .unwrap();
+
+        let blame = vcs.blame(Path::new("t/a.md")).unwrap();
+        assert_eq!(blame.len(), 3, "one entry per line");
+        // Line numbers are 1-based and contiguous.
+        assert_eq!(
+            blame.iter().map(|l| l.line_no).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        // Every line is attributed to the single agent author.
+        for line in &blame {
+            assert_eq!(line.author, "deepseek-v4-flash/s1 <agent@ai-write.local>");
+            assert_eq!(line.short_sha.len(), SHORT_SHA_LEN);
+        }
+    }
+
+    #[test]
+    fn blame_maps_each_line_to_the_writer_that_last_touched_it() {
+        // Kernel §9: line-level attribution must distinguish human from model.
+        // Build a two-writer history in a temp repo and assert each line maps to
+        // the expected author.
+        let (dir, vcs) = repo();
+
+        // v1: the agent writes a three-line draft. All three lines are the agent's.
+        write(&dir, "t/a.md", "agent first\nagent second\nagent third\n");
+        let sha_v1 = vcs
+            .commit_file(Path::new("t/a.md"), &agent("slave-1"), "v1: agent draft")
+            .unwrap();
+
+        // v2: a human revises only the *middle* line, leaving lines 1 and 3 as the
+        // agent's. Git blame must split the file: lines 1 & 3 → agent commit,
+        // line 2 → the human commit.
+        write(&dir, "t/a.md", "agent first\nhuman revised\nagent third\n");
+        let sha_v2 = vcs
+            .commit_file(Path::new("t/a.md"), &WriterId::Human, "v2: human edits l2")
+            .unwrap();
+
+        let blame = vcs.blame(Path::new("t/a.md")).unwrap();
+        assert_eq!(blame.len(), 3);
+
+        const AGENT: &str = "deepseek-v4-flash/slave-1 <agent@ai-write.local>";
+        const HUMAN: &str = "human <human@ai-write.local>";
+
+        // Line 1: untouched by the human → still the agent's v1 commit.
+        assert_eq!(blame[0].line_no, 1);
+        assert_eq!(blame[0].author, AGENT);
+        assert_eq!(blame[0].short_sha, sha_v1);
+
+        // Line 2: the human's v2 commit.
+        assert_eq!(blame[1].line_no, 2);
+        assert_eq!(blame[1].author, HUMAN);
+        assert_eq!(blame[1].short_sha, sha_v2);
+
+        // Line 3: untouched by the human → still the agent's v1 commit.
+        assert_eq!(blame[2].line_no, 3);
+        assert_eq!(blame[2].author, AGENT);
+        assert_eq!(blame[2].short_sha, sha_v1);
+    }
+
+    #[test]
+    fn blame_reflects_only_committed_content_not_the_work_tree() {
+        let (dir, vcs) = repo();
+        write(&dir, "t/a.md", "committed line\n");
+        vcs.commit_file(Path::new("t/a.md"), &agent("s1"), "v1")
+            .unwrap();
+        // Dirty the work tree without committing; blame still reflects HEAD.
+        write(&dir, "t/a.md", "committed line\ndirty uncommitted line\n");
+
+        let blame = vcs.blame(Path::new("t/a.md")).unwrap();
+        assert_eq!(blame.len(), 1, "only the committed line is attributed");
+        assert_eq!(blame[0].line_no, 1);
+        assert_eq!(
+            blame[0].author,
+            "deepseek-v4-flash/s1 <agent@ai-write.local>"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blame_non_utf8_path_is_non_utf8_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let (dir, vcs) = repo();
+        write(&dir, "t/a.md", "x\n");
+        vcs.commit_file(Path::new("t/a.md"), &agent("s1"), "v1")
+            .unwrap();
+        let bad = Path::new(OsStr::from_bytes(b"t/\xff.md"));
+        let err = vcs.blame(bad).unwrap_err();
+        assert!(matches!(err, VcsError::NonUtf8Path(_)), "got: {err:?}");
     }
 }

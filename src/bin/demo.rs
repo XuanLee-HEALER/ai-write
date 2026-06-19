@@ -83,6 +83,8 @@ fn main() {
         file_name: file_name.to_string(),
         task: task.clone(),
         writer: writer.clone(),
+        system_prompt: None,
+        skill: None,
     };
 
     eprintln!("dispatching slave: theme={theme:?} file={file_name:?}");

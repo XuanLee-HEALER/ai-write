@@ -55,6 +55,59 @@ impl AuthorId {
     }
 }
 
+/// Bridges the workspace writer identity into the content model's author
+/// identity (the deferred B2 integration adapter, `docs/impl-v2-results.md` §5).
+///
+/// [`WriterId`](crate::tool::workspace::WriterId) (the lock holder / git author,
+/// feature-gated behind `blocking`) and [`AuthorId`] (the per-character author,
+/// always available) are the same two cases — human or model-backed agent — and
+/// their provenance tags already line up one-to-one
+/// ([`WriterId::provenance_tag`](crate::tool::workspace::WriterId::provenance_tag)
+/// equals [`AuthorId::tag`]). This `From` makes that correspondence explicit so a
+/// coordinator-routed edit can record the writer as the author of the characters
+/// it wrote.
+///
+/// # Examples
+///
+/// ```
+/// use ai_write::content::AuthorId;
+/// use ai_write::tool::workspace::WriterId;
+///
+/// assert_eq!(AuthorId::from(WriterId::Human), AuthorId::Human);
+///
+/// let writer = WriterId::Agent { model: "deepseek-v4-pro".into(), label: "slave-1".into() };
+/// let author = AuthorId::from(writer.clone());
+/// // The tags agree, which is the whole point of the adapter.
+/// assert_eq!(author.tag(), writer.provenance_tag());
+/// ```
+#[cfg(feature = "blocking")]
+impl From<crate::tool::workspace::WriterId> for AuthorId {
+    fn from(writer: crate::tool::workspace::WriterId) -> Self {
+        use crate::tool::workspace::WriterId;
+        match writer {
+            WriterId::Human => AuthorId::Human,
+            WriterId::Agent { model, label } => AuthorId::Agent { model, label },
+        }
+    }
+}
+
+/// Borrowed counterpart of the [`From<WriterId>`](AuthorId) adapter, for call
+/// sites that hold a `&WriterId` (the coordinator's transaction writer) and do
+/// not want to clone it.
+#[cfg(feature = "blocking")]
+impl From<&crate::tool::workspace::WriterId> for AuthorId {
+    fn from(writer: &crate::tool::workspace::WriterId) -> Self {
+        use crate::tool::workspace::WriterId;
+        match writer {
+            WriterId::Human => AuthorId::Human,
+            WriterId::Agent { model, label } => AuthorId::Agent {
+                model: model.clone(),
+                label: label.clone(),
+            },
+        }
+    }
+}
+
 /// A maximal run of contiguous text written by a single [`AuthorId`].
 ///
 /// Runs are the unit of character-level authorship: splitting a run at an offset

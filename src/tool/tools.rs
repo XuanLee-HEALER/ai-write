@@ -1,4 +1,4 @@
-//! The v0 native writing tools (everything except search).
+//! The v0 native writing tools, plus the outward web/reference search tool.
 //!
 //! Each tool implements the [`Tool`] trait: it advertises a
 //! JSON-schema [`req::Tool`](crate::req::Tool) definition and performs its work
@@ -7,25 +7,38 @@
 //! [`ToolError`] values and surfaced back to the model as the content of a `tool`
 //! reply, never aborting the session.
 //!
-//! The set mirrors `impl-v0.md` §3:
+//! The set mirrors `impl-v0.md` §3, with locking made implicit per edit by the
+//! [`coordinator`](crate::coordinator) (kernel §6) — there are no longer any
+//! model-facing `acquire_lock` / `release_lock` tools:
 //!
-//! | Tool | Holds lock | Purpose |
-//! |---|---|---|
-//! | [`CreateTheme`] / [`DeleteTheme`] | — | theme directories |
-//! | [`CreateArticle`] / [`DeleteArticle`] / [`ListArticles`] | — | article files + index |
-//! | [`ReadArticle`] / [`Find`] | — | read full text / search the workspace |
-//! | [`WriteArticle`] | ✅ | full overwrite |
-//! | [`EditArticle`] | ✅ | exact unique `old` → `new` replace |
-//! | [`ApplyEdits`] | ✅ | fine-grained, atomic batch of offset/anchor ops |
-//! | [`AcquireLock`] / [`ReleaseLock`] | — | single-writer article lock |
-//! | [`ArticleHistory`] / [`ArticleDiff`] | — | git version history / unified diff |
-//! | [`UndoLast`] | ✅ | article-level undo (restore + re-commit) |
-//! | [`Report`] | — | slave → master structured report |
+//! | Tool | Purpose |
+//! |---|---|
+//! | [`CreateTheme`] / [`DeleteTheme`] | theme directories |
+//! | [`CreateArticle`] / [`DeleteArticle`] / [`ListArticles`] | article files + index |
+//! | [`ReadArticle`] / [`Find`] | read full text / substring-search the workspace |
+//! | [`SearchTool`](crate::search::SearchTool) | outward web/reference search (kernel §10), via a pluggable backend |
+//! | [`WriteArticle`] | full overwrite (one atomic commit) |
+//! | [`EditArticle`] | exact unique `old` → `new` replace (one atomic commit) |
+//! | [`ApplyEdits`] | fine-grained, atomic batch of offset/anchor ops (one commit) |
+//! | [`SplitArticle`] / [`MergeArticles`] | cross-file split/merge (one commit, declared lock set) |
+//! | [`ArticleHistory`] / [`ArticleDiff`] | git version history / unified diff |
+//! | [`ArticleBlame`] | per-line authorship (`git blame`, kernel §9) |
+//! | [`UndoLast`] | article-level undo (restore + re-commit) |
+//! | [`Report`] | slave → master structured report |
 //!
-//! The [`ArticleHistory`] / [`ArticleDiff`] / [`UndoLast`] tools are backed by
-//! the [`vcs`](crate::vcs) module and require a [`Vcs`](crate::vcs::Vcs) attached
-//! to the [`ToolCtx`] (the [`session`](crate::session) layer attaches one); they
-//! return [`ToolError::Vcs`] when version control is not enabled.
+//! The three article editors route each edit through
+//! [`Coordinator::submit`](crate::coordinator::Coordinator::submit) when a
+//! coordinator is attached to the [`ToolCtx`] (the [`engine`](crate::engine)
+//! shares one across the master and every slave): the declared lock set is the
+//! article plus its theme `index.json`, acquired all-or-nothing, and the body and
+//! manifest are committed together as **one** commit. Without a coordinator they
+//! fall back to writing through the workspace and committing directly.
+//!
+//! The [`ArticleHistory`] / [`ArticleDiff`] / [`ArticleBlame`] / [`UndoLast`]
+//! tools are backed by
+//! the [`vcs`](crate::vcs) module; they read through the coordinator's exclusive
+//! [`Vcs`](crate::vcs::Vcs) when one is attached, or a directly attached `Vcs`
+//! otherwise, and return [`ToolError::Vcs`] when neither is enabled.
 //!
 //! [`ToolCtx`]: crate::tool::ToolCtx
 //! [`ToolError`]: crate::tool::ToolError
@@ -75,10 +88,17 @@ fn commit_result(theme: &str, file_name: &str, sha: Option<String>, extra: Value
     out
 }
 
-/// Registers all v0 native writing tools (everything except search) into a fresh
+/// Registers all v0 native writing tools into a fresh
 /// [`ToolRegistry`](crate::tool::ToolRegistry).
 ///
-/// This is the tool set a slave session is configured with.
+/// This is the tool set a slave session is configured with. It includes the
+/// local substring [`Find`] **and** the outward web/reference
+/// [`SearchTool`](crate::search::SearchTool) (kernel §10): the two are
+/// orthogonal — `find` scans the on-disk workspace, `search` reaches outside it.
+/// The search tool is wired with the no-network
+/// [`StubProvider`](crate::search::StubProvider) by default (it answers with an
+/// explicit "no search backend configured" result); a host that has connected an
+/// MCP search server swaps in a real provider via [`writing_tools_with_search`].
 ///
 /// # Examples
 ///
@@ -86,9 +106,30 @@ fn commit_result(theme: &str, file_name: &str, sha: Option<String>, extra: Value
 /// use ai_write::tool::tools::writing_tools;
 ///
 /// let registry = writing_tools();
-/// assert!(registry.len() >= 15);
+/// assert!(registry.len() >= 17);
 /// ```
 pub fn writing_tools() -> crate::tool::ToolRegistry {
+    writing_tools_with_search(crate::search::SearchTool::with_stub())
+}
+
+/// Registers all v0 native writing tools, using the supplied
+/// [`SearchTool`](crate::search::SearchTool) for the outward search capability.
+///
+/// Use this instead of [`writing_tools`] when a real
+/// [`SearchProvider`](crate::search::SearchProvider) (e.g. an adapter over a
+/// session-connected MCP search server) is available, so the `search` tool is
+/// live rather than the no-network stub. Everything else is identical.
+///
+/// # Examples
+///
+/// ```
+/// use ai_write::search::SearchTool;
+/// use ai_write::tool::tools::writing_tools_with_search;
+///
+/// let registry = writing_tools_with_search(SearchTool::with_stub());
+/// assert!(registry.len() >= 17);
+/// ```
+pub fn writing_tools_with_search(search: crate::search::SearchTool) -> crate::tool::ToolRegistry {
     let mut r = crate::tool::ToolRegistry::new();
     r.register(Box::new(CreateTheme))
         .register(Box::new(DeleteTheme))
@@ -97,13 +138,15 @@ pub fn writing_tools() -> crate::tool::ToolRegistry {
         .register(Box::new(ListArticles))
         .register(Box::new(ReadArticle))
         .register(Box::new(Find))
+        .register(Box::new(search))
         .register(Box::new(WriteArticle))
         .register(Box::new(EditArticle))
         .register(Box::new(ApplyEdits))
-        .register(Box::new(AcquireLock))
-        .register(Box::new(ReleaseLock))
+        .register(Box::new(SplitArticle))
+        .register(Box::new(MergeArticles))
         .register(Box::new(ArticleHistory))
         .register(Box::new(ArticleDiff))
+        .register(Box::new(ArticleBlame))
         .register(Box::new(UndoLast))
         .register(Box::new(Report));
     r
@@ -440,8 +483,8 @@ impl Tool for WriteArticle {
     fn schema(&self) -> ReqTool {
         def(
             "write_article",
-            "Replace an article's entire body with new text. You must hold the \
-             article lock (call acquire_lock first).",
+            "Replace an article's entire body with new text. Locking and version \
+             control are automatic: each edit is one atomic commit.",
             json!({
                 "type": "object",
                 "properties": {
@@ -456,16 +499,13 @@ impl Tool for WriteArticle {
 
     fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
         let a: WriteArticleArgs = parse_args(args)?;
-        let writer = ctx.writer.clone();
-        ctx.ws
-            .write_article(&a.theme, &a.file_name, &a.text, &writer)?;
         let message = format!(
             "edit({}/{}): write_article ({} bytes)",
             a.theme,
             a.file_name,
             a.text.len()
         );
-        let sha = ctx.commit_article(&a.theme, &a.file_name, &message)?;
+        let sha = ctx.commit_full_text(&a.theme, &a.file_name, &a.text, &message)?;
         Ok(commit_result(
             &a.theme,
             &a.file_name,
@@ -497,8 +537,8 @@ impl Tool for EditArticle {
             "edit_article",
             "Replace one exact, unique occurrence of `old` with `new` in an \
              article. Fails if `old` is absent or occurs more than once — include \
-             enough surrounding context to make it unique. You must hold the \
-             article lock.",
+             enough surrounding context to make it unique. Locking and version \
+             control are automatic: each edit is one atomic commit.",
             json!({
                 "type": "object",
                 "properties": {
@@ -517,7 +557,6 @@ impl Tool for EditArticle {
         if a.old.is_empty() {
             return Err(ToolError::InvalidArgs("`old` must not be empty".into()));
         }
-        let writer = ctx.writer.clone();
         let current = ctx.ws.read_article(&a.theme, &a.file_name)?;
 
         let count = current.matches(&a.old).count();
@@ -538,13 +577,11 @@ impl Tool for EditArticle {
         }
 
         let updated = current.replacen(&a.old, &a.new, 1);
-        ctx.ws
-            .write_article(&a.theme, &a.file_name, &updated, &writer)?;
         let message = format!(
             "edit({}/{}): edit_article (1 replacement)",
             a.theme, a.file_name
         );
-        let sha = ctx.commit_article(&a.theme, &a.file_name, &message)?;
+        let sha = ctx.commit_full_text(&a.theme, &a.file_name, &updated, &message)?;
         Ok(commit_result(&a.theme, &a.file_name, sha, json!({})))
     }
 }
@@ -798,8 +835,8 @@ impl Tool for ApplyEdits {
              replace (a byte range, or a unique anchor). All edits resolve against \
              the text as it was before the batch; if any edit fails (anchor not \
              unique, offset off a character boundary, spans overlap) the whole \
-             batch is rolled back and nothing is written. You must hold the \
-             article lock.",
+             batch is rolled back and nothing is written. Locking and version \
+             control are automatic: each successful batch is one atomic commit.",
             json!({
                 "type": "object",
                 "properties": {
@@ -837,84 +874,225 @@ impl Tool for ApplyEdits {
     fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
         let a: ApplyEditsArgs = parse_args(args)?;
         let op_count = a.edits.len();
-        let writer = ctx.writer.clone();
         let current = ctx.ws.read_article(&a.theme, &a.file_name)?;
         let updated = apply_edits_atomic(&current, a.edits)?;
-        ctx.ws
-            .write_article(&a.theme, &a.file_name, &updated, &writer)?;
         let message = format!(
             "edit({}/{}): apply_edits {} ops",
             a.theme, a.file_name, op_count
         );
-        let sha = ctx.commit_article(&a.theme, &a.file_name, &message)?;
+        let sha = ctx.commit_full_text(&a.theme, &a.file_name, &updated, &message)?;
         Ok(commit_result(&a.theme, &a.file_name, sha, json!({})))
     }
 }
 
 // ===========================================================================
-// Locks
+// Cross-file structural operations (split / merge)
 // ===========================================================================
 
-/// Acquires the single-writer lock on an article for the calling writer.
-pub struct AcquireLock;
-
-impl Tool for AcquireLock {
-    fn name(&self) -> &str {
-        "acquire_lock"
-    }
-
-    fn schema(&self) -> ReqTool {
-        def(
-            "acquire_lock",
-            "Acquire the single-writer lock on an article before editing it. \
-             Fails if another writer holds it.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "theme": string_prop("The theme the article belongs to."),
-                    "file_name": string_prop("The article file name to lock."),
-                },
-                "required": ["theme", "file_name"],
-            }),
-        )
-    }
-
-    fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
-        let a: ArticleRef = parse_args(args)?;
-        let writer = ctx.writer.clone();
-        ctx.ws.acquire_lock(&a.theme, &a.file_name, &writer)?;
-        Ok(json!({ "locked": format!("{}/{}", a.theme, a.file_name) }))
+/// Maps a [`CoordError`](crate::coordinator::CoordError) to the [`ToolError`] the
+/// model sees for a split/merge transaction.
+fn coord_tool_error(err: crate::coordinator::CoordError) -> ToolError {
+    use crate::coordinator::CoordError;
+    match err {
+        CoordError::Undeclared(path) => ToolError::InvalidArgs(format!(
+            "operation touched an undeclared output path: {} (declare every output file up front)",
+            path.display()
+        )),
+        CoordError::Workspace(e) => e,
+        CoordError::Vcs(e) => ToolError::Vcs(e.to_string()),
+        CoordError::Aborted(msg) => ToolError::InvalidArgs(msg),
     }
 }
 
-/// Releases the article lock held by the calling writer.
-pub struct ReleaseLock;
+/// A single output article in a [`SplitArticle`] / [`MergeArticles`] request, as
+/// the model supplies it.
+#[derive(Deserialize)]
+struct OutputArticleArgs {
+    file_name: String,
+    #[serde(default)]
+    title: String,
+    content: String,
+    #[serde(default)]
+    parent: Option<String>,
+}
 
-impl Tool for ReleaseLock {
+impl OutputArticleArgs {
+    /// Lowers the model-supplied output into the coordinator's [`NewArticle`].
+    fn into_new_article(self) -> crate::coordinator::NewArticle {
+        crate::coordinator::NewArticle {
+            file_name: self.file_name,
+            title: self.title,
+            content: self.content,
+            parent: self.parent,
+        }
+    }
+}
+
+/// Splits one source article into several new articles in a single atomic commit.
+pub struct SplitArticle;
+
+#[derive(Deserialize)]
+struct SplitArticleArgs {
+    theme: String,
+    source_file: String,
+    source_content: String,
+    outputs: Vec<OutputArticleArgs>,
+}
+
+impl Tool for SplitArticle {
     fn name(&self) -> &str {
-        "release_lock"
+        "split_article"
     }
 
     fn schema(&self) -> ReqTool {
         def(
-            "release_lock",
-            "Release the single-writer lock you hold on an article.",
+            "split_article",
+            "Split one source article into several new articles in a single atomic \
+             commit. The source is rewritten to `source_content` (its retained \
+             overview portion — pass its current text to keep it unchanged), and \
+             each entry in `outputs` becomes a brand-new article with its own body, \
+             title, and optional parent. You MUST enumerate every output file up \
+             front: the set of files the operation touches (the source, each \
+             output, and the theme index) is locked together and committed once. \
+             An output that already exists, collides with the source, or is \
+             duplicated is rejected.",
             json!({
                 "type": "object",
                 "properties": {
-                    "theme": string_prop("The theme the article belongs to."),
-                    "file_name": string_prop("The article file name to unlock."),
+                    "theme": string_prop("The theme the source and all outputs live in."),
+                    "source_file": string_prop("The source article file name to split."),
+                    "source_content": string_prop("The new body the source is rewritten to (its retained portion)."),
+                    "outputs": {
+                        "type": "array",
+                        "description": "The new articles to carve out, in reading order. Declaring the full list up front is required.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file_name": string_prop("The new article file name (a single path segment)."),
+                                "title": string_prop("A human-readable title for the new article."),
+                                "content": string_prop("The full body of the new article."),
+                                "parent": string_prop("Optional parent article file name in the theme hierarchy."),
+                            },
+                            "required": ["file_name", "content"],
+                        },
+                    },
                 },
-                "required": ["theme", "file_name"],
+                "required": ["theme", "source_file", "source_content", "outputs"],
             }),
         )
     }
 
     fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
-        let a: ArticleRef = parse_args(args)?;
-        let writer = ctx.writer.clone();
-        ctx.ws.release_lock(&a.theme, &a.file_name, &writer)?;
-        Ok(json!({ "released": format!("{}/{}", a.theme, a.file_name) }))
+        let a: SplitArticleArgs = parse_args(args)?;
+        let Some(coord) = ctx.coord.clone() else {
+            return Err(ToolError::Other(
+                "split_article requires the transaction coordinator (it is a cross-file operation)"
+                    .to_string(),
+            ));
+        };
+        let outputs: Vec<crate::coordinator::NewArticle> = a
+            .outputs
+            .into_iter()
+            .map(OutputArticleArgs::into_new_article)
+            .collect();
+        let output_names: Vec<String> = outputs.iter().map(|o| o.file_name.clone()).collect();
+        let plan = crate::coordinator::SplitPlan {
+            theme: a.theme.clone(),
+            source_file: a.source_file.clone(),
+            source_content: a.source_content,
+            outputs,
+        };
+        let outcome = coord
+            .split_article(ctx.writer.clone(), plan)
+            .map_err(coord_tool_error)?;
+        let mut out = json!({
+            "split": format!("{}/{}", a.theme, a.source_file),
+            "outputs": output_names,
+        });
+        if let (Some(map), Some(sha)) = (out.as_object_mut(), outcome.sha) {
+            map.insert("committed".to_string(), Value::String(sha));
+        }
+        Ok(out)
+    }
+}
+
+/// Merges several source articles into one target article in a single atomic
+/// commit.
+pub struct MergeArticles;
+
+#[derive(Deserialize)]
+struct MergeArticlesArgs {
+    theme: String,
+    sources: Vec<String>,
+    target: OutputArticleArgs,
+}
+
+impl Tool for MergeArticles {
+    fn name(&self) -> &str {
+        "merge_articles"
+    }
+
+    fn schema(&self) -> ReqTool {
+        def(
+            "merge_articles",
+            "Merge several source articles into one target article in a single \
+             atomic commit. The `target` article is created with the merged body \
+             you supply, then every `sources` article is deleted and removed from \
+             the index. You MUST list every source plus the target up front: those \
+             files (and the theme index) are locked together and committed once. \
+             Requires at least two sources; a target that collides with a surviving \
+             article is rejected (the target may reuse a source's name).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "theme": string_prop("The theme the sources and target live in."),
+                    "sources": {
+                        "type": "array",
+                        "description": "The source article file names to merge and then delete (at least two).",
+                        "items": { "type": "string" },
+                    },
+                    "target": {
+                        "type": "object",
+                        "description": "The new article the merged content is written into.",
+                        "properties": {
+                            "file_name": string_prop("The target article file name."),
+                            "title": string_prop("A human-readable title for the target article."),
+                            "content": string_prop("The full merged body."),
+                            "parent": string_prop("Optional parent article file name in the theme hierarchy."),
+                        },
+                        "required": ["file_name", "content"],
+                    },
+                },
+                "required": ["theme", "sources", "target"],
+            }),
+        )
+    }
+
+    fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
+        let a: MergeArticlesArgs = parse_args(args)?;
+        let Some(coord) = ctx.coord.clone() else {
+            return Err(ToolError::Other(
+                "merge_articles requires the transaction coordinator (it is a cross-file operation)"
+                    .to_string(),
+            ));
+        };
+        let target_name = a.target.file_name.clone();
+        let plan = crate::coordinator::MergePlan {
+            theme: a.theme.clone(),
+            sources: a.sources.clone(),
+            target: a.target.into_new_article(),
+        };
+        let outcome = coord
+            .merge_articles(ctx.writer.clone(), plan)
+            .map_err(coord_tool_error)?;
+        let mut out = json!({
+            "merged": a.sources,
+            "into": format!("{}/{}", a.theme, target_name),
+        });
+        if let (Some(map), Some(sha)) = (out.as_object_mut(), outcome.sha) {
+            map.insert("committed".to_string(), Value::String(sha));
+        }
+        Ok(out)
     }
 }
 
@@ -922,13 +1100,29 @@ impl Tool for ReleaseLock {
 // Version control (history / diff / undo)
 // ===========================================================================
 
-/// Resolves the article's workspace-relative path (`<theme>/<file_name>`) for a
-/// version-control tool, or [`ToolError::Vcs`] when no [`Vcs`](crate::vcs::Vcs)
-/// is attached to the context.
-fn require_vcs<'a>(ctx: &'a ToolCtx<'_>) -> Result<&'a crate::vcs::Vcs, ToolError> {
-    ctx.vcs.ok_or_else(|| {
-        ToolError::Vcs("version control is not enabled for this workspace".to_string())
-    })
+/// Maps a [`VcsError`](crate::vcs::VcsError) to the [`ToolError::Vcs`] the model
+/// sees.
+fn vcs_tool_error(err: crate::vcs::VcsError) -> ToolError {
+    ToolError::Vcs(err.to_string())
+}
+
+/// Runs `op` against whichever version-control backend is attached: the shared
+/// [`Coordinator`](crate::coordinator::Coordinator)'s exclusive
+/// [`Vcs`](crate::vcs::Vcs) (preferred, so reads serialize with commits), or a
+/// directly attached `Vcs`. Returns [`ToolError::Vcs`] when neither is present.
+fn with_vcs<R>(
+    ctx: &ToolCtx<'_>,
+    op: impl FnOnce(&crate::vcs::Vcs) -> Result<R, crate::vcs::VcsError>,
+) -> Result<R, ToolError> {
+    if let Some(coord) = ctx.coord.as_ref() {
+        return coord.with_vcs(op).map_err(vcs_tool_error);
+    }
+    if let Some(vcs) = ctx.vcs {
+        return op(vcs).map_err(vcs_tool_error);
+    }
+    Err(ToolError::Vcs(
+        "version control is not enabled for this workspace".to_string(),
+    ))
 }
 
 /// Lists an article's commit history (newest first), backed by libgit2.
@@ -959,11 +1153,8 @@ impl Tool for ArticleHistory {
 
     fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
         let a: ArticleRef = parse_args(args)?;
-        let vcs = require_vcs(ctx)?;
         let rel = std::path::Path::new(&a.theme).join(&a.file_name);
-        let history = vcs
-            .history(&rel)
-            .map_err(|e| ToolError::Vcs(e.to_string()))?;
+        let history = with_vcs(ctx, |vcs| vcs.history(&rel))?;
         Ok(json!({ "history": history }))
     }
 }
@@ -1009,12 +1200,47 @@ impl Tool for ArticleDiff {
 
     fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
         let a: ArticleDiffArgs = parse_args(args)?;
-        let vcs = require_vcs(ctx)?;
         let rel = std::path::Path::new(&a.theme).join(&a.file_name);
-        let patch = vcs
-            .diff(&rel, a.from.as_deref(), a.to.as_deref())
-            .map_err(|e| ToolError::Vcs(e.to_string()))?;
+        let patch = with_vcs(ctx, |vcs| {
+            vcs.diff(&rel, a.from.as_deref(), a.to.as_deref())
+        })?;
         Ok(json!({ "diff": patch }))
+    }
+}
+
+/// Reports per-line authorship of an article (`git blame`), backed by libgit2.
+pub struct ArticleBlame;
+
+impl Tool for ArticleBlame {
+    fn name(&self) -> &str {
+        "article_blame"
+    }
+
+    fn schema(&self) -> ReqTool {
+        def(
+            "article_blame",
+            "Show line-by-line authorship of an article (git blame). Returns one \
+             entry per line of the article's last committed version, each with a \
+             1-based line number, the author (the writer who last touched that \
+             line — `human …` or `<model>/<label> …`), and the short commit id. \
+             Use it to see who wrote which part. Reflects committed content only; \
+             uncommitted edits are not attributed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "theme": string_prop("The theme the article belongs to."),
+                    "file_name": string_prop("The article file name."),
+                },
+                "required": ["theme", "file_name"],
+            }),
+        )
+    }
+
+    fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
+        let a: ArticleRef = parse_args(args)?;
+        let rel = std::path::Path::new(&a.theme).join(&a.file_name);
+        let blame = with_vcs(ctx, |vcs| vcs.blame(&rel))?;
+        Ok(json!({ "blame": blame }))
     }
 }
 
@@ -1034,7 +1260,7 @@ impl Tool for UndoLast {
              committed version and record that restoration as a new commit \
              (history is preserved, never rewritten). Returns the new commit id, \
              or reports that there was nothing to undo when the article has only \
-             one version. You must hold the article lock.",
+             one version. Locking is automatic.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1049,14 +1275,11 @@ impl Tool for UndoLast {
     fn call(&self, args: Value, ctx: &mut ToolCtx<'_>) -> ToolResult {
         let a: ArticleRef = parse_args(args)?;
         let writer = ctx.writer.clone();
-        // Undo writes to the article file, so honour the single-writer lock just
-        // like the other editors.
-        ctx.ws.ensure_lock_held(&a.theme, &a.file_name, &writer)?;
-        let vcs = require_vcs(ctx)?;
+        // Undo writes the article and commits the revert; with a coordinator
+        // attached this runs through its exclusive Vcs (serialized with every
+        // other commit), so locking is implicit — no explicit lock is needed.
         let rel = std::path::Path::new(&a.theme).join(&a.file_name);
-        let reverted = vcs
-            .undo_last(&rel, &writer)
-            .map_err(|e| ToolError::Vcs(e.to_string()))?;
+        let reverted = with_vcs(ctx, |vcs| vcs.undo_last(&rel, &writer))?;
         match reverted {
             Some(sha) => Ok(json!({
                 "undone": format!("{}/{}", a.theme, a.file_name),
@@ -1185,19 +1408,26 @@ mod tests {
             "list_articles",
             "read_article",
             "find",
+            "search",
             "write_article",
             "edit_article",
             "apply_edits",
-            "acquire_lock",
-            "release_lock",
+            "split_article",
+            "merge_articles",
             "article_history",
             "article_diff",
+            "article_blame",
             "undo_last",
             "report",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(r.len(), 16);
+        // The explicit lock tools were removed: locking is now implicit per edit
+        // through the coordinator (kernel §6).
+        assert!(!names.contains(&"acquire_lock".to_string()));
+        assert!(!names.contains(&"release_lock".to_string()));
+        // 17 local writing tools + the outward `search` tool (kernel §10).
+        assert_eq!(r.len(), 18);
     }
 
     #[test]
@@ -1319,30 +1549,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ws.read_article("t", "a.md").unwrap(), "hi");
-    }
-
-    #[test]
-    fn acquire_and_release_lock_tools() {
-        let (_d, mut ws) = fixture();
-        call(
-            &mut ws,
-            &AcquireLock,
-            json!({ "theme": "t", "file_name": "a.md" }),
-        )
-        .unwrap();
-        // Now writable.
-        ws.write_article("t", "a.md", "x", &agent()).unwrap();
-        call(
-            &mut ws,
-            &ReleaseLock,
-            json!({ "theme": "t", "file_name": "a.md" }),
-        )
-        .unwrap();
-        // After release, write fails.
-        assert!(matches!(
-            ws.write_article("t", "a.md", "y", &agent()),
-            Err(ToolError::Lock(_))
-        ));
     }
 
     #[test]
@@ -1652,20 +1858,29 @@ mod tests {
     }
 
     #[test]
-    fn index_json_is_committed_alongside_the_article() {
+    fn index_json_is_committed_in_the_same_commit_as_the_article() {
         let (_d, mut ws, vcs) = vcs_fixture();
-        call_vcs(
+        let out = call_vcs(
             &mut ws,
             &vcs,
             &WriteArticle,
             json!({ "theme": "t", "file_name": "a.md", "text": "body" }),
         )
         .unwrap();
-        // The theme index (which records the new contributor) is versioned too,
-        // as its own separate commit.
+        let sha = out["committed"].as_str().expect("committed sha");
+
+        // The theme index (which records the new contributor) is versioned in the
+        // SAME single commit as the body — one cognitive unit is one commit, not
+        // two (the pre-coordinator behaviour committed body and index separately).
+        let article_hist = vcs.history(std::path::Path::new("t/a.md")).unwrap();
         let index_hist = vcs.history(std::path::Path::new("t/index.json")).unwrap();
-        assert_eq!(index_hist.len(), 1, "index.json must be committed");
-        assert!(index_hist[0].message.contains("index(t)"));
+        assert_eq!(article_hist.len(), 1, "article touched by one commit");
+        assert_eq!(index_hist.len(), 1, "index.json touched by one commit");
+        assert_eq!(
+            article_hist[0].id, index_hist[0].id,
+            "body and index share the same single commit"
+        );
+        assert_eq!(article_hist[0].id, sha);
     }
 
     #[test]
@@ -1766,9 +1981,9 @@ mod tests {
             json!({ "theme": "t", "file_name": "a.md", "text": "line two\n" }),
         )
         .unwrap();
-        // Diff between the two article commits, located via history (each edit
-        // also produces an index commit, so HEAD~1 is not the prior *article*
-        // version — use the real commit ids instead).
+        // Diff between the two article commits, located via history. Each edit is
+        // now exactly one commit (body + index together), so the two entries are
+        // the two article versions.
         let hist = vcs.history(std::path::Path::new("t/a.md")).unwrap();
         let (newest, prior) = (&hist[0].id, &hist[1].id);
         let out = call_vcs(
@@ -1781,6 +1996,70 @@ mod tests {
         let patch = out["diff"].as_str().unwrap();
         assert!(patch.contains("-line one"), "patch: {patch}");
         assert!(patch.contains("+line two"), "patch: {patch}");
+    }
+
+    #[test]
+    fn article_blame_tool_attributes_each_line_to_its_writer() {
+        // Kernel §9: the blame tool must report per-line authorship that
+        // distinguishes a human edit from a model edit. Build a two-writer
+        // history through the editors, then assert the tool's output.
+        let (_d, mut ws, vcs) = vcs_fixture();
+        // v1: the agent (vcs_fixture's writer) writes a three-line draft.
+        call_vcs(
+            &mut ws,
+            &vcs,
+            &WriteArticle,
+            json!({
+                "theme": "t",
+                "file_name": "a.md",
+                "text": "agent first\nagent second\nagent third\n",
+            }),
+        )
+        .unwrap();
+        // v2: a human revises only the middle line. Hand the article lock over
+        // from the fixture's agent to the human first (the editors require the
+        // caller to hold the lock).
+        ws.release_lock("t", "a.md", &agent()).unwrap();
+        ws.acquire_lock("t", "a.md", &WriterId::Human).unwrap();
+        {
+            let mut ctx = ToolCtx::new(&mut ws, WriterId::Human).with_vcs(&vcs);
+            WriteArticle
+                .call(
+                    json!({
+                        "theme": "t",
+                        "file_name": "a.md",
+                        "text": "agent first\nhuman revised\nagent third\n",
+                    }),
+                    &mut ctx,
+                )
+                .unwrap();
+        }
+        // Restore the agent's lock so the final `call_vcs` (agent writer) blame
+        // read does not trip the single-writer lock.
+        ws.release_lock("t", "a.md", &WriterId::Human).unwrap();
+        ws.acquire_lock("t", "a.md", &agent()).unwrap();
+
+        let out = call_vcs(
+            &mut ws,
+            &vcs,
+            &ArticleBlame,
+            json!({ "theme": "t", "file_name": "a.md" }),
+        )
+        .unwrap();
+        let lines = out["blame"].as_array().unwrap();
+        assert_eq!(lines.len(), 3, "one entry per line");
+
+        let author = |i: usize| lines[i]["author"].as_str().unwrap();
+        let line_no = |i: usize| lines[i]["line_no"].as_u64().unwrap();
+
+        // Line 1 & 3: untouched by the human → still the agent's commit.
+        assert_eq!(line_no(0), 1);
+        assert_eq!(author(0), "deepseek-v4-pro/s1 <agent@ai-write.local>");
+        // Line 2: the human's edit.
+        assert_eq!(line_no(1), 2);
+        assert_eq!(author(1), "human <human@ai-write.local>");
+        assert_eq!(line_no(2), 3);
+        assert_eq!(author(2), "deepseek-v4-pro/s1 <agent@ai-write.local>");
     }
 
     #[test]
@@ -1817,24 +2096,30 @@ mod tests {
     }
 
     #[test]
-    fn undo_last_tool_requires_lock() {
+    fn undo_last_tool_needs_no_explicit_lock() {
+        // Locking is now implicit: undo no longer requires the caller to hold an
+        // explicit lock. Two committed versions, then undo, succeeds even with the
+        // workspace lock released.
         let (_d, mut ws, vcs) = vcs_fixture();
-        call_vcs(
-            &mut ws,
-            &vcs,
-            &WriteArticle,
-            json!({ "theme": "t", "file_name": "a.md", "text": "x\n" }),
-        )
-        .unwrap();
+        for text in ["one\n", "two\n"] {
+            call_vcs(
+                &mut ws,
+                &vcs,
+                &WriteArticle,
+                json!({ "theme": "t", "file_name": "a.md", "text": text }),
+            )
+            .unwrap();
+        }
         ws.release_lock("t", "a.md", &agent()).unwrap();
-        let err = call_vcs(
+        let out = call_vcs(
             &mut ws,
             &vcs,
             &UndoLast,
             json!({ "theme": "t", "file_name": "a.md" }),
         )
-        .unwrap_err();
-        assert!(matches!(err, ToolError::Lock(_)));
+        .unwrap();
+        assert!(out["committed"].is_string());
+        assert_eq!(ws.read_article("t", "a.md").unwrap(), "one\n");
     }
 
     #[test]
@@ -1859,7 +2144,8 @@ mod tests {
 
     #[test]
     fn history_tools_error_when_vcs_disabled() {
-        // Without a Vcs attached, the version-control tools surface ToolError::Vcs.
+        // Without a Vcs or coordinator attached, the version-control tools surface
+        // ToolError::Vcs.
         let (_d, mut ws) = fixture();
         let err = call(
             &mut ws,
@@ -1868,5 +2154,254 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ToolError::Vcs(_)));
+    }
+
+    // ----- coordinator-routed edits (implicit locking, single commit) -------
+
+    use std::sync::Arc;
+
+    use crate::coordinator::Coordinator;
+
+    /// Dispatches one tool call against a context carrying a shared
+    /// [`Coordinator`], with a fresh per-thread workspace handle for read tools.
+    fn call_coord(
+        ws: &mut Workspace,
+        coord: Arc<Coordinator>,
+        tool: &dyn Tool,
+        args: Value,
+    ) -> ToolResult {
+        let mut ctx = ToolCtx::new(ws, agent()).with_coordinator(coord);
+        tool.call(args, &mut ctx)
+    }
+
+    #[test]
+    fn coordinator_routed_write_commits_body_and_index_as_one_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let coord = Arc::new(Coordinator::open(dir.path()).expect("coordinator"));
+        coord
+            .with_workspace(|ws| {
+                ws.create_theme("t")?;
+                ws.create_article("t", "a.md", "A", None)
+            })
+            .unwrap();
+        // A second, read-only workspace handle stands in for the session's own.
+        let mut ws = Workspace::open(dir.path()).expect("reopen");
+
+        // No explicit lock acquired anywhere: the coordinator locks implicitly.
+        let out = call_coord(
+            &mut ws,
+            Arc::clone(&coord),
+            &WriteArticle,
+            json!({ "theme": "t", "file_name": "a.md", "text": "coordinated body" }),
+        )
+        .unwrap();
+        let sha = out["committed"]
+            .as_str()
+            .expect("committed sha")
+            .to_string();
+
+        // The body and index landed in exactly ONE commit, via the coordinator's
+        // single Vcs.
+        coord
+            .with_vcs(|vcs| {
+                let hist_a = vcs.history(std::path::Path::new("t/a.md"))?;
+                let hist_i = vcs.history(std::path::Path::new("t/index.json"))?;
+                assert_eq!(hist_a.len(), 1, "article: one commit");
+                assert_eq!(hist_i.len(), 1, "index: one commit");
+                assert_eq!(hist_a[0].id, hist_i[0].id, "same single commit");
+                assert_eq!(hist_a[0].id, sha);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            coord
+                .with_workspace(|ws| ws.read_article("t", "a.md"))
+                .unwrap(),
+            "coordinated body"
+        );
+    }
+
+    #[test]
+    fn coordinator_routed_history_reads_through_the_coordinator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let coord = Arc::new(Coordinator::open(dir.path()).expect("coordinator"));
+        coord
+            .with_workspace(|ws| {
+                ws.create_theme("t")?;
+                ws.create_article("t", "a.md", "A", None)
+            })
+            .unwrap();
+        let mut ws = Workspace::open(dir.path()).expect("reopen");
+
+        for text in ["v1", "v2"] {
+            call_coord(
+                &mut ws,
+                Arc::clone(&coord),
+                &WriteArticle,
+                json!({ "theme": "t", "file_name": "a.md", "text": text }),
+            )
+            .unwrap();
+        }
+        // The history tool reads through the coordinator's Vcs (no direct Vcs set).
+        let out = call_coord(
+            &mut ws,
+            Arc::clone(&coord),
+            &ArticleHistory,
+            json!({ "theme": "t", "file_name": "a.md" }),
+        )
+        .unwrap();
+        assert_eq!(out["history"].as_array().unwrap().len(), 2);
+    }
+
+    // ----- split / merge native tools (G5) ----------------------------------
+
+    /// Opens a coordinator over a fresh temp dir, creates theme `t` with the named
+    /// articles, and returns the temp dir (kept alive), the shared coordinator, and
+    /// a second read-only workspace handle for tool dispatch.
+    fn split_merge_fixture(articles: &[&str]) -> (tempfile::TempDir, Arc<Coordinator>, Workspace) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let coord = Arc::new(Coordinator::open(dir.path()).expect("coordinator"));
+        coord
+            .with_workspace(|ws| {
+                ws.create_theme("t")?;
+                for a in articles {
+                    ws.create_article("t", a, a, None)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let ws = Workspace::open(dir.path()).expect("reopen");
+        (dir, coord, ws)
+    }
+
+    #[test]
+    fn split_article_tool_commits_once_and_updates_manifest() {
+        let (_d, coord, mut ws) = split_merge_fixture(&["all.md"]);
+        let out = call_coord(
+            &mut ws,
+            Arc::clone(&coord),
+            &SplitArticle,
+            json!({
+                "theme": "t",
+                "source_file": "all.md",
+                "source_content": "intro\n",
+                "outputs": [
+                    { "file_name": "a.md", "title": "A", "content": "a\n", "parent": "all.md" },
+                    { "file_name": "b.md", "title": "B", "content": "b\n", "parent": "all.md" }
+                ]
+            }),
+        )
+        .unwrap();
+        let sha = out["committed"]
+            .as_str()
+            .expect("committed sha")
+            .to_string();
+        assert_eq!(out["outputs"], json!(["a.md", "b.md"]));
+
+        // One commit; source + both new files + index all share it.
+        coord
+            .with_vcs(|vcs| {
+                for rel in ["t/all.md", "t/a.md", "t/b.md", "t/index.json"] {
+                    assert_eq!(vcs.history(std::path::Path::new(rel)).unwrap()[0].id, sha);
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        // Manifest reflects the new hierarchy.
+        let outline = coord.with_workspace(|w| w.article_outline("t")).unwrap();
+        let files: Vec<&str> = outline.iter().map(|o| o.file.as_str()).collect();
+        assert_eq!(files, vec!["all.md", "a.md", "b.md"]);
+        assert_eq!(outline[1].parent.as_deref(), Some("all.md"));
+    }
+
+    #[test]
+    fn merge_articles_tool_commits_once_and_updates_manifest() {
+        let (_d, coord, mut ws) = split_merge_fixture(&["a.md", "b.md"]);
+        let out = call_coord(
+            &mut ws,
+            Arc::clone(&coord),
+            &MergeArticles,
+            json!({
+                "theme": "t",
+                "sources": ["a.md", "b.md"],
+                "target": { "file_name": "merged.md", "title": "Merged", "content": "ab\n" }
+            }),
+        )
+        .unwrap();
+        let sha = out["committed"]
+            .as_str()
+            .expect("committed sha")
+            .to_string();
+        assert_eq!(out["into"], "t/merged.md");
+
+        coord
+            .with_vcs(|vcs| {
+                assert_eq!(
+                    vcs.history(std::path::Path::new("t/merged.md")).unwrap()[0].id,
+                    sha
+                );
+                assert_eq!(
+                    vcs.history(std::path::Path::new("t/index.json")).unwrap()[0].id,
+                    sha
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let files = coord.with_workspace(|w| w.list_articles("t")).unwrap();
+        assert_eq!(files, vec!["merged.md"]);
+    }
+
+    #[test]
+    fn split_article_tool_rejects_duplicate_output() {
+        let (_d, coord, mut ws) = split_merge_fixture(&["all.md"]);
+        let err = call_coord(
+            &mut ws,
+            Arc::clone(&coord),
+            &SplitArticle,
+            json!({
+                "theme": "t",
+                "source_file": "all.md",
+                "source_content": "x",
+                "outputs": [
+                    { "file_name": "a.md", "content": "1" },
+                    { "file_name": "a.md", "content": "2" }
+                ]
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn split_merge_tools_require_a_coordinator() {
+        // Without a coordinator attached the cross-file tools refuse: they are
+        // inherently multi-file transactions that must funnel through one.
+        let (_d, mut ws) = fixture();
+        let err = call(
+            &mut ws,
+            &SplitArticle,
+            json!({
+                "theme": "t",
+                "source_file": "a.md",
+                "source_content": "x",
+                "outputs": [ { "file_name": "b.md", "content": "y" } ]
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Other(_)), "got {err:?}");
+
+        let err = call(
+            &mut ws,
+            &MergeArticles,
+            json!({
+                "theme": "t",
+                "sources": ["a.md", "x.md"],
+                "target": { "file_name": "m.md", "content": "y" }
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Other(_)), "got {err:?}");
     }
 }

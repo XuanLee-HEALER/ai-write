@@ -148,6 +148,53 @@ pub enum Event {
         /// The terminal outcome of the run.
         outcome: String,
     },
+    /// A writer acquired the transaction lock and entered the critical section
+    /// (coordinator observability, B3). Emitted by the
+    /// [`Coordinator`](crate::coordinator::Coordinator) the instant a ticket's
+    /// whole declared lock set is granted, before its body runs. A UI renders a
+    /// "busy" banner while a writer holds the transaction.
+    TxnAcquired {
+        /// The writer that entered the critical section, as its provenance tag
+        /// (`"human"` or `"<model>/<label>"`).
+        writer: String,
+        /// The workspace-relative paths the transaction holds, in canonical
+        /// (sorted) order.
+        paths: Vec<String>,
+    },
+    /// A writer parked in the wait queue because the critical section was busy
+    /// (coordinator observability, B3). Emitted by the
+    /// [`Coordinator`](crate::coordinator::Coordinator) when a submitted ticket
+    /// cannot proceed immediately. `ahead` is how many tickets sit in front of it
+    /// at enqueue time (a human inserts at the queue head, so its `ahead` counts
+    /// only earlier humans). A UI renders a cancellable "queued" indicator.
+    TxnQueued {
+        /// The waiting writer, as its provenance tag.
+        writer: String,
+        /// The number of tickets ahead of this one in the wait queue at the moment
+        /// it parked.
+        ahead: usize,
+    },
+    /// A writer's transaction committed and released its locks (coordinator
+    /// observability, B3). Emitted by the
+    /// [`Coordinator`](crate::coordinator::Coordinator) after the single commit,
+    /// as the locks are freed and the next waiter is woken. A UI clears the "busy"
+    /// banner on this event.
+    TxnReleased {
+        /// The writer whose transaction released, as its provenance tag.
+        writer: String,
+    },
+    /// Control passed to a waiting human at the head of the queue (coordinator
+    /// observability, B3). Emitted by the
+    /// [`Coordinator`](crate::coordinator::Coordinator) when a human-priority
+    /// ticket acquires the lock after an agent's transaction released it — the
+    /// "it's your turn" signal a [`request_edit`](crate::coordinator::Coordinator::request_edit)
+    /// ticket waits for. A UI raises a "your turn" banner for the named article.
+    HandoffToHuman {
+        /// The theme of the article the human acquired the lock for.
+        theme: String,
+        /// The article file the human acquired the lock for.
+        file: String,
+    },
 }
 
 /// A consumer of [`Event`]s emitted by the writing layers.
@@ -238,6 +285,10 @@ mod tests {
                 Event::SlaveSpawned { .. } => "SlaveSpawned",
                 Event::SlaveReported { .. } => "SlaveReported",
                 Event::Finished { .. } => "Finished",
+                Event::TxnAcquired { .. } => "TxnAcquired",
+                Event::TxnQueued { .. } => "TxnQueued",
+                Event::TxnReleased { .. } => "TxnReleased",
+                Event::HandoffToHuman { .. } => "HandoffToHuman",
             }
         }
     }

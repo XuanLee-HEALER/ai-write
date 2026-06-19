@@ -1,0 +1,208 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+/* Dark mode driven by a `.dark` class (mode-watcher). The paper theme is the
+ * primary deliverable (decision §11·7); dark is a deferred secondary skin, so
+ * the dark token block below only neutralizes the shadcn primitives — full dark
+ * fidelity is out of scope for F0. */
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * AI-Write design tokens — light / warm / paper (decision §11·7), ported from the
+ * Claude Design canvas (AI-Write.dc.html). Exposed as Tailwind v4 theme tokens so
+ * utilities like `bg-paper`, `text-ink`, `border-rule`, `font-disp` work, and as
+ * raw CSS variables for bespoke business components.
+ */
+@theme {
+	/* responsive breakpoints (ui-ux-design-draft §4.1). Tailwind's defaults are
+	 * replaced so `sm:`/`md:`/`lg:`/`xl:`/`2xl:` map to our form factors, matching
+	 * the JS breakpoints in stores/layout.svelte.ts. `xs` (<480) is the implicit
+	 * base (no prefix) — phone portrait. */
+	--breakpoint-sm: 30rem; /* 480px — phone landscape / small */
+	--breakpoint-md: 48rem; /* 768px — tablet portrait */
+	--breakpoint-lg: 64rem; /* 1024px — tablet landscape / small laptop */
+	--breakpoint-xl: 80rem; /* 1280px — desktop */
+	--breakpoint-2xl: 105rem; /* 1680px — large desktop */
+
+	/* surfaces */
+	--color-paper: #fcfcfb;
+	--color-cream: #f4f1ea;
+	--color-cream2: #efe9dd;
+	--color-card: #ffffff;
+
+	/* ink scale */
+	--color-ink: #1b1a18;
+	--color-ink-soft: #45423c;
+	--color-ink-faint: #6f6b62;
+	--color-ink-ghost: #9a958b;
+
+	/* accent + rules */
+	--color-accent: #7a2e2e;
+	--color-rule: #d8d4cc;
+	--color-rule-soft: #e8e5de;
+
+	/* authorship palette (oklch; human + two model families) */
+	--color-author-you: oklch(0.44 0.075 255);
+	--color-author-chat: oklch(0.45 0.08 152);
+	--color-author-reasoner: oklch(0.47 0.09 62);
+
+	/* state colors */
+	--color-live: oklch(0.6 0.12 150);
+	--color-warn: oklch(0.72 0.13 70);
+	--color-busy: oklch(0.55 0.1 62);
+	--color-turn: oklch(0.55 0.1 150);
+
+	/* typography */
+	--font-serif: Georgia, 'Songti SC', 'Noto Serif SC', serif;
+	--font-disp: 'Palatino Linotype', 'Book Antiqua', Palatino, 'Songti SC', 'Noto Serif SC', serif;
+	--font-mono: 'SF Mono', ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace;
+
+	/* radius */
+	--radius-card: 0.5rem;
+}
+
+/*
+ * shadcn-svelte semantic tokens, mapped onto the paper palette so every primitive
+ * (button/command/dialog/tabs/sonner/tooltip/dropdown/select/scroll-area) renders
+ * warm + paper instead of the default stone neutral. Kept as raw CSS variables
+ * (not @theme) because shadcn references them via `--color-*` indirection below.
+ */
+:root {
+	--accent-tint: rgba(122, 46, 46, 0.07);
+
+	--radius: 0.5rem;
+
+	--background: var(--color-paper);
+	--foreground: var(--color-ink);
+	--card: var(--color-card);
+	--card-foreground: var(--color-ink);
+	--popover: var(--color-paper);
+	--popover-foreground: var(--color-ink);
+	--primary: var(--color-accent);
+	--primary-foreground: #ffffff;
+	--secondary: var(--color-cream2);
+	--secondary-foreground: var(--color-ink-soft);
+	--muted: var(--color-cream);
+	--muted-foreground: var(--color-ink-faint);
+	--accent: var(--color-cream2);
+	--accent-foreground: var(--color-ink);
+	--destructive: oklch(0.52 0.17 25);
+	--border: var(--color-rule);
+	--input: var(--color-rule);
+	--ring: var(--color-accent);
+}
+
+.dark {
+	--background: #1b1a18;
+	--foreground: #f4f1ea;
+	--card: #232220;
+	--card-foreground: #f4f1ea;
+	--popover: #232220;
+	--popover-foreground: #f4f1ea;
+	--primary: #c98a6a;
+	--primary-foreground: #1b1a18;
+	--secondary: #2c2a27;
+	--secondary-foreground: #e8e5de;
+	--muted: #232220;
+	--muted-foreground: #9a958b;
+	--accent: #2c2a27;
+	--accent-foreground: #f4f1ea;
+	--destructive: oklch(0.62 0.17 25);
+	--border: #38352f;
+	--input: #38352f;
+	--ring: #c98a6a;
+}
+
+/* Bridge the raw shadcn vars into Tailwind v4 `--color-*` utilities so classes
+ * like `bg-background`, `text-muted-foreground`, `border-border` resolve. */
+@theme inline {
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-destructive-foreground: #ffffff;
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+
+	--radius-sm: calc(var(--radius) - 4px);
+	--radius-md: calc(var(--radius) - 2px);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+	* {
+		border-color: var(--color-border);
+	}
+}
+
+html,
+body {
+	height: 100%;
+	margin: 0;
+}
+
+body {
+	background: var(--color-paper);
+	color: var(--color-ink);
+	font-family: var(--font-serif);
+	font-size: 15px;
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+::selection {
+	background: rgba(122, 46, 46, 0.16);
+}
+
+/* keyframes reused from the design canvas */
+@keyframes softpulse {
+	0%,
+	100% {
+		opacity: 1;
+	}
+	50% {
+		opacity: 0.32;
+	}
+}
+@keyframes slidein {
+	from {
+		opacity: 0;
+		transform: translateY(7px);
+	}
+	to {
+		opacity: 1;
+		transform: none;
+	}
+}
+
+/* thin warm scrollbars (matches the design canvas) */
+[data-scroll] {
+	scrollbar-width: thin;
+	scrollbar-color: #d3cec5 transparent;
+}
+[data-scroll]::-webkit-scrollbar {
+	width: 9px;
+	height: 9px;
+}
+[data-scroll]::-webkit-scrollbar-thumb {
+	background: #d3cec5;
+	border-radius: 5px;
+	border: 2px solid transparent;
+	background-clip: padding-box;
+}
+[data-scroll]::-webkit-scrollbar-thumb:hover {
+	background: #c2bcb0;
+	background-clip: padding-box;
+}

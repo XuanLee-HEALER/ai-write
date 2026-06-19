@@ -1,7 +1,25 @@
-//! ai-write —— DeepSeek V4 辅助写作工具。
+//! ai-write — a DeepSeek-driven framework for human–AI collaborative writing.
 //!
-//! 当前仅含最底层 `req` module:无状态 DeepSeek API wrapper。
-//! 详见 `docs/req-module-design.md`。
+//! The crate is layered so each concern is usable on its own:
+//!
+//! - [`req`] — a stateless DeepSeek API client wrapper (sync via `ureq`, or
+//!   async via `reqwest` under the `async` feature). Always available.
+//! - [`content`], [`dsl`], [`provenance`] — the shared rich-text data model
+//!   (runs carrying character-level authorship), a line-oriented rich-text DSL
+//!   over it, and the single edit primitive that preserves authorship. Pure,
+//!   always available.
+//! - [`skill`] — writing skills: named system-prompt presets loaded from disk.
+//!   Pure, always available.
+//! - [`session`], [`tool`], [`coordinator`], [`vcs`], [`observe`], [`search`] —
+//!   the synchronous collaborative-writing substrate (turn engine, tool +
+//!   workspace model, transaction coordinator, git versioning, event stream,
+//!   pluggable search), gated on the `blocking` feature.
+//! - [`engine`] — Master/Slave orchestration built on that substrate (`blocking`).
+//! - [`webui`] — an `axum` + SSE JSON/SSE API backend (`webui` feature),
+//!   consumed by the SvelteKit frontend under `web/`.
+//!
+//! See `CLAUDE.md` (code-structure section) and `docs/` for design and
+//! implementation notes.
 
 pub mod req;
 

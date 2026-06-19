@@ -112,15 +112,6 @@ dev:
 
 [windows]
 dev:
-    #!/usr/bin/env pwsh
-    $ErrorActionPreference = 'Stop'
-    Write-Host "▸ 启动后端 API (axum) on http://127.0.0.1:8080 …"
-    $api = Start-Process cargo -ArgumentList 'run','--bin','webui','--features','webui' -NoNewWindow -PassThru
-    try {
-        Write-Host "▸ 启动前端 dev (vite) on http://localhost:5173  (Ctrl-C 停止全部)"
-        Set-Location web
-        bun run dev
-    } finally {
-        Write-Host "▸ 停止后端 API ($($api.Id))"
-        Stop-Process -Id $api.Id -ErrorAction SilentlyContinue
-    }
+    $api = Start-Process cargo -ArgumentList 'run','--bin','webui','--features','webui' -NoNewWindow -PassThru; \
+        Write-Host "▸ 后端 API (axum) on http://127.0.0.1:8080  |  前端 vite on http://localhost:5173  (Ctrl-C 一起停)"; \
+        try { Set-Location web; bun run dev } finally { Write-Host "▸ 停止后端 API ($($api.Id))"; Stop-Process -Id $api.Id -ErrorAction SilentlyContinue }

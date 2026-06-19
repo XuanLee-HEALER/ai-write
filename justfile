@@ -51,7 +51,49 @@ test-live:
 demo theme task:
     set -a; . ./.env; set +a; cargo run --bin demo -- "{{theme}}" "{{task}}"
 
-# 展示用 WebUI(读 .env 的 DEEPSEEK_API_KEY):axum + SSE 服务,浏览器看 AI 写作过程
-# 默认监听 127.0.0.1:8080,工作区 ./workspace(可用 AI_WRITE_BIND / AI_WRITE_WORKSPACE 覆盖)
+# 后端域 API(读 .env 的 DEEPSEEK_API_KEY):axum 纯 JSON/SSE API,**不再内嵌 UI**。
+# UI 是 web/ 的 SvelteKit 前端(见 web-dev / dev)。默认监听 127.0.0.1:8080,
+# 工作区 ./workspace(可用 AI_WRITE_BIND / AI_WRITE_WORKSPACE / AI_WRITE_SKILLS 覆盖)。
 webui:
     set -a; . ./.env; set +a; cargo run --bin webui --features webui
+
+# `api` 是 `webui` 的别名(语义更准:它现在是纯后端 API)。
+api: webui
+
+# ---- 前端 web/(SvelteKit + bun + Tailwind + shadcn-svelte) ----
+
+# 安装前端依赖(首次必跑一次)
+web-install:
+    cd web && bun install
+
+# 前端 dev server(Vite,:5173;/api 含 SSE 代理到 :8080 的 axum)。
+# 需先 `just web-install` 一次,且后端在跑(`just webui`)。浏览器开 http://localhost:5173
+# (注意:vite 绑 localhost/IPv6,用 localhost 而非 127.0.0.1 访问)
+web-dev:
+    cd web && bun run dev
+
+# 构建前端(adapter-node 产物供 Hono/Bun 生产服务器挂载)
+web-build:
+    cd web && bun run build
+
+# 前端类型检查(svelte-check)
+web-check:
+    cd web && bun run check
+
+# 前端生产服务器(Hono on Bun:挂 adapter-node 产物 + 反代 /api[含 SSE] 到 axum)。
+# 先 `just web-build`;AI_WRITE_API 默认 http://127.0.0.1:8080,PORT 默认 3000。
+web-serve:
+    cd web && bun run start
+
+# 一键全栈本地开发:后端 API(:8080,后台)+ 前端 dev(:5173,前台);Ctrl-C 一起停。
+# 首次先 `just web-install`。起来后浏览器开 http://localhost:5173
+dev:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    set -a; . ./.env; set +a
+    echo "▸ 启动后端 API (axum) on http://127.0.0.1:8080 …"
+    cargo run --bin webui --features webui &
+    api_pid=$!
+    trap 'echo; echo "▸ 停止后端 API ($api_pid)"; kill $api_pid 2>/dev/null || true' EXIT INT TERM
+    echo "▸ 启动前端 dev (vite) on http://localhost:5173  (Ctrl-C 停止全部)"
+    cd web && bun run dev

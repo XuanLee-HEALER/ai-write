@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Write 设计内核</title>
+<style>
+  :root{
+    --paper:#fcfcfb;
+    --ink:#1b1a18;
+    --ink-soft:#45423c;
+    --ink-faint:#6f6b62;
+    --accent:#7a2e2e;        /* 仅用于环境标签与对话引用标记 */
+    --rule:#d8d4cc;
+    --rule-soft:#e8e5de;
+    --maxw:44rem;
+    --serif-body: Georgia, "Songti SC","STSong","Source Han Serif SC","Noto Serif CJK SC", SimSun, serif;
+    --serif-disp: "Palatino Linotype","Book Antiqua", Palatino, "Songti SC","Source Han Serif SC","Noto Serif CJK SC", serif;
+    --mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+
+  *{ box-sizing:border-box; }
+
+  html{ -webkit-text-size-adjust:100%; }
+
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:var(--serif-body);
+    font-size:17px;
+    line-height:1.9;
+    text-rendering:optimizeLegibility;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  .wrap{
+    max-width:var(--maxw);
+    margin:0 auto;
+    padding:5.5rem 1.5rem 7rem;
+  }
+
+  /* ---- title block ---- */
+  .eyebrow{
+    font-family:var(--serif-disp);
+    font-size:.78rem;
+    letter-spacing:.34em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    margin:0 0 1.6rem;
+  }
+  h1{
+    font-family:var(--serif-disp);
+    font-weight:600;
+    font-size:2.35rem;
+    line-height:1.22;
+    letter-spacing:.005em;
+    margin:0 0 .55rem;
+  }
+  .subtitle{
+    font-family:var(--serif-disp);
+    font-style:italic;
+    font-size:1.18rem;
+    color:var(--ink-soft);
+    line-height:1.5;
+    margin:0 0 1.7rem;
+  }
+  .meta{
+    font-size:.85rem;
+    color:var(--ink-faint);
+    letter-spacing:.02em;
+    border-top:1px solid var(--rule);
+    border-bottom:1px solid var(--rule);
+    padding:.7rem 0;
+    margin:0 0 2.8rem;
+  }
+  .meta .mono{ font-family:var(--mono); font-size:.8rem; }
+
+  /* ---- abstract ---- */
+  .abstract{
+    font-size:.98rem;
+    line-height:1.85;
+    color:var(--ink-soft);
+    margin:0 0 3.2rem;
+    padding:0 0 0 1.2rem;
+    border-left:2px solid var(--rule);
+  }
+  .abstract .lead{
+    font-variant:small-caps;
+    letter-spacing:.08em;
+    color:var(--ink-faint);
+    font-size:.85rem;
+    display:block;
+    margin-bottom:.5rem;
+  }
+
+  /* ---- sections ---- */
+  section{ margin-top:3rem; }
+  h2{
+    font-family:var(--serif-disp);
+    font-weight:600;
+    font-size:1.42rem;
+    line-height:1.3;
+    margin:0 0 1.1rem;
+    padding-bottom:.4rem;
+    border-bottom:1px solid var(--rule-soft);
+  }
+  h2 .sn{
+    color:var(--accent);
+    font-weight:600;
+    margin-right:.55rem;
+    font-variant-numeric:lining-nums;
+  }
+  h3{
+    font-family:var(--serif-disp);
+    font-weight:600;
+    font-size:1.08rem;
+    margin:2rem 0 .6rem;
+    color:var(--ink);
+  }
+
+  p{ margin:0 0 1.1rem; text-align:justify; }
+  p.tight{ margin-bottom:.55rem; }
+
+  em{ font-style:italic; }
+  strong{ font-weight:600; }
+  .mono{ font-family:var(--mono); font-size:.86em; }
+
+  /* ---- theorem environments ---- */
+  .env{
+    margin:1.7rem 0;
+    padding:.15rem 0 .15rem 1.25rem;
+    border-left:2px solid var(--accent);
+  }
+  .env > .label{
+    display:block;
+    font-family:var(--serif-disp);
+    font-size:.9rem;
+    letter-spacing:.05em;
+    color:var(--accent);
+    font-weight:600;
+    margin-bottom:.35rem;
+  }
+  .env > .label .nm{ font-variant-numeric:lining-nums; }
+  .env > .label .nh{
+    color:var(--ink-soft);
+    font-weight:500;
+    font-style:italic;
+  }
+  .env p:last-child{ margin-bottom:0; }
+  .env.statement p{ font-style:normal; }
+
+  /* corollary: lighter rule */
+  .env.cor{ border-left-color:var(--rule); }
+  .env.cor > .label{ color:var(--ink-faint); }
+
+  /* ---- citation markers ---- */
+  sup.ref{ line-height:0; font-size:0; }
+  sup.ref a{
+    font-family:var(--serif-disp);
+    font-size:.62rem;
+    line-height:0;
+    vertical-align:.45em;
+    color:var(--accent);
+    text-decoration:none;
+    letter-spacing:.04em;
+    padding:0 .04em;
+  }
+  sup.ref a:hover{ text-decoration:underline; }
+  sup.ref a::before{ content:"["; }
+  sup.ref a::after{ content:"]"; }
+
+  /* ---- references ---- */
+  .refs{ margin-top:3.6rem; padding-top:1.6rem; border-top:1px solid var(--rule); }
+  .refs h2{ border:none; font-size:1.18rem; margin-bottom:1rem; }
+  .refs ol{ margin:0; padding:0; list-style:none; counter-reset:r; }
+  .refs li{
+    position:relative;
+    padding-left:3.1rem;
+    margin-bottom:1rem;
+    font-size:.9rem;
+    line-height:1.7;
+    color:var(--ink-soft);
+  }
+  .refs li::before{
+    content:"D" counter(r);
+    counter-increment:r;
+    position:absolute;
+    left:0; top:0;
+    font-family:var(--serif-disp);
+    font-size:.78rem;
+    color:var(--accent);
+    letter-spacing:.03em;
+  }
+  .refs .q{ color:var(--ink); font-style:italic; }
+  .refs .q::before{ content:"“"; }
+  .refs .q::after{ content:"”"; }
+
+  .colophon{
+    margin-top:3rem;
+    padding-top:1.4rem;
+    border-top:1px solid var(--rule-soft);
+    font-size:.8rem;
+    color:var(--ink-faint);
+    line-height:1.7;
+  }
+
+  hr.thin{ border:none; border-top:1px solid var(--rule-soft); margin:2.4rem 0; }
+
+  a{ color:var(--accent); }
+
+  /* ---- responsive ---- */
+  @media (max-width:640px){
+    body{ font-size:16px; line-height:1.85; }
+    .wrap{ padding:3.2rem 1.15rem 4.5rem; }
+    h1{ font-size:1.85rem; }
+    .subtitle{ font-size:1.05rem; }
+    p{ text-align:left; }
+  }
+
+  /* ---- print ---- */
+  @page{ margin:2.2cm; }
+  @media print{
+    :root{ --maxw:none; }
+    body{ background:#fff; color:#000; font-size:11.5pt; line-height:1.7; }
+    .wrap{ padding:0; }
+    .env, .abstract{ break-inside:avoid; }
+    h2,h3{ break-after:avoid; }
+    a{ color:inherit; text-decoration:none; }
+    sup.ref a{ color:#555; }
+    .colophon{ color:#555; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="eyebrow">设计内核 · 草案</p>
+  <h1>AI-Write</h1>
+  <p class="subtitle">人机共写的一种工作机制——从两条公理推导的协作、并发与署名模型</p>
+  <p class="meta">
+    Mouselee &nbsp;·&nbsp; v0.1 &nbsp;·&nbsp; 2026-06-18 &nbsp;·&nbsp; 引擎 <span class="mono">deepseek</span> &nbsp;·&nbsp; 整理自一次设计对话
+  </p>
+
+  <div class="abstract">
+    <span class="lead">摘要</span>
+    本文记录 AI-Write 的设计内核。它不是功能清单，而是从两条公理——<em>抛弃形式主义</em>与<em>人机同等地位</em>——展开的一套自洽推导。根抽象是「一篇文章对应一个文件」，并以「任何已提交状态都是成品」为不变量。事实源是文件本身，而非模型上下文或会话历史；协作以 diff 序列异步进行，commit 是人与 AI 唯一可通约的认知单元边界；并发由单一 coordinator 以声明锁、全序授予、队首优先、以及「提交进入临界区」来保证原子性与无死锁；reasoning 不持久化——这既是工程对称性的要求，也是「作品即产出」这一本体立场的推论；共有版权由 diff 的作者归属充当唯一诚实证据。文末标出一条无法在系统层弥合的边界。
+  </div>
+
+  <!-- 1 -->
+  <section>
+    <h2><span class="sn">1</span>问题与立场</h2>
+    <p>一句话：基于 DeepSeek 的、人与 AI 协作进行写作的一种工作机制。本文只谈底层机制，不谈 UI 表现；只谈内核，不谈功能堆叠。把它定义为<em>工具</em>而非产品是刻意的——工具不替你完成写作，它只提供让协作得以诚实发生的最小结构。</p>
+    <p>下文的组织方式刻意采用治学体例：先立公理，再由公理推得抽象、不变量与各项机制。这样做不是修辞，而是因为这套设计本身就是两条公理的展开——任何一条机制若不能从公理推得，就不属于内核。</p>
+  </section>
+
+  <!-- 2 -->
+  <section>
+    <h2><span class="sn">2</span>两条公理</h2>
+    <p>整套设计奠基于两条不加证明的命题。它们彼此独立，却在每一处机制上交汇。</p>
+
+    <div class="env statement">
+      <span class="label"><span class="nm">公理 Ⅰ</span> · <span class="nh">抛弃形式主义</span></span>
+      <p>写作中一切不属于「思考 → 改动」这一最小闭环的东西，都是形式主义。阶段是形式（把一次思考切片并固化成多个产物），状态标记是形式（成品态恒真，无需标记），独立大纲产物是形式（大纲要么进正文、要么属于思考本身，不该单独存活）。<sup class="ref"><a href="#refs" >D2</a></sup><sup class="ref"><a href="#refs">D8</a></sup></p>
+    </div>
+
+    <div class="env statement">
+      <span class="label"><span class="nm">公理 Ⅱ</span> · <span class="nh">人机同等地位</span></span>
+      <p>人与 AI 在本系统中地位对称。任何机制都不得预设一方拥有另一方不具备的特权形态——无论是特权的中断能力，还是特权的、被持久化的思想痕迹。<sup class="ref"><a href="#refs">D8</a></sup></p>
+    </div>
+
+    <p>后文每一节都是这两条的推论。读者可在任意结论处反向追问：它依据公理 Ⅰ 还是 Ⅱ？若两者皆不依据，则该结论应被删去。</p>
+  </section>
+
+  <!-- 3 -->
+  <section>
+    <h2><span class="sn">3</span>根抽象与恒成品不变量</h2>
+
+    <div class="env statement">
+      <span class="label"><span class="nm">定义</span> · <span class="nh">文章即文件</span></span>
+      <p>一篇文章对应且仅对应一个文件，这是不可再分的根抽象。主题（topic）对应一个目录，文章（article）对应一个文件。AI 直接写正文，人也直接改正文；二者之间不存在任何中间产物。<sup class="ref"><a href="#refs">D1</a></sup></p>
+    </div>
+
+    <div class="env statement">
+      <span class="label"><span class="nm">不变量</span> · <span class="nh">恒成品</span></span>
+      <p>任何<em>已提交</em>状态都是一篇自洽、可读、可交付的成品。不存在需要特殊对待的「半成品中间态」。严格地说，该不变量只在 commit 边界成立——git 的原子提交是它的执行机制，而非装饰。<sup class="ref"><a href="#refs">D1</a></sup></p>
+    </div>
+
+    <div class="env cor">
+      <span class="label"><span class="nm">推论 3.1</span></span>
+      <p>不存在「草稿 vs 成品」的状态区分。成品态恒真，因而无需被标记；标记它，恰是公理 Ⅰ 所斥的形式主义。「任何时刻都是成品」与「成品自足、无需随身携带其理由来证成自己」是同一句话的两面——这一点将在 §8 与 reasoning 的处置重新咬合。</p>
+    </div>
+  </section>
+
+  <!-- 4 -->
+  <section>
+    <h2><span class="sn">4</span>事实源</h2>
+    <p>事实源（SSOT）是磁盘上的文件本身，不是 LLM 的上下文，也不是会话历史。人与 AI 都基于当前文件做推理与操作，且每一步都从磁盘<em>重读</em>当前状态。</p>
+    <p>这条之所以是地基，因为它让「人改了 → AI 从改后的状态继续」天然成立，而不必靠补丁硬凑：若事实源落在 AI 的 context 里，人改了文件、AI 仍按脑中旧版本推进，必然打架且不可恢复；唯有事实源落在磁盘、AI 每步重读，参与才不会退化成混乱。Skill 配置与系统提示词同理——它们是从磁盘重读的状态，不钉在 context 里；中途修改只影响其后从磁盘重读的步骤，这与本节原则保持一致。</p>
+  </section>
+
+  <!-- 5 -->
+  <section>
+    <h2><span class="sn">5</span>协作模型：diff 即信道</h2>
+    <p>过程的可见性不来自「观看 AI 如何落笔」。AI 的推理藏在原始 reasoning 块、不入正文；要看的不是它怎么写，而是它改了什么。<sup class="ref"><a href="#refs">D3</a></sup>因此过程的可见性由 diff 序列承载，事后阅读 commit 历史即足。</p>
+    <p>由此，协作模型对齐到 <em>git 协作本身</em>：双方异步在文件上工作，互斥写保证不撕裂，diff 是双方之间唯一真正可通约的事实记录。<sup class="ref"><a href="#refs">D4</a></sup>版本、归属、署名、历史这一簇需求，全部落在 libgit2 这一个底座上。<sup class="ref"><a href="#refs">D5</a></sup></p>
+
+    <div class="env statement">
+      <span class="label"><span class="nm">定义</span> · <span class="nh">认知单元</span></span>
+      <p>一次编辑 = 一个自包含的认知单元：自带其理由（reasoning，不落盘）、其对成品的改动（diff）、其归属（git author）。不可压缩的核就是一次 commit——它恰好编码「一个认知单元落到成品上」。</p>
+    </div>
+
+    <div class="env cor">
+      <span class="label"><span class="nm">推论 5.1</span> · <span class="nh">commit 与编辑同构</span></span>
+      <p>commit 的语义边界，正好等于上面定义的编辑的语义边界。这就是 git 不是顺手选的版本工具、而是这套哲学天然容器的原因：二者同构。<sup class="ref"><a href="#refs">D8</a></sup></p>
+    </div>
+  </section>
+
+  <!-- 6 -->
+  <section>
+    <h2><span class="sn">6</span>并发控制</h2>
+    <p>单文件排他锁对单文件精修足够，但拆分 / 合并是<em>跨文件逻辑操作</em>：它同时触碰原文件、新建文件、以及结构索引。其作用域大于单文件锁。这里有个被「无非是多文件变更」一句轻易盖住的硬点——多文件原子性恰是 git 最弱的一环：原子提交只保证<em>单次 commit</em> 全有全无，不保证一次<em>逻辑操作</em>的原子性。</p>
+
+    <h3>6.1 coordinator 作为事务边界</h3>
+    <p>解法是引入单一 coordinator，把锁从文件级升到操作级。<sup class="ref"><a href="#refs">D6</a></sup>它不只是锁管理器，更是「多文件改 + 单 commit」的事务提交者。<sup class="ref"><a href="#refs">D7</a></sup>其性质如下，每一条都不可省：</p>
+
+    <div class="env statement">
+      <span class="label"><span class="nm">机制 6.A</span> · <span class="nh">声明锁</span></span>
+      <p>所有需锁操作的影响集预先可知<sup class="ref"><a href="#refs">D7</a></sup>，故锁可在操作开始前一次性全部声明。系统中不存在「写到一半才确定要碰哪些文件」的操作——这一前提决定了声明锁模型成立，而非乐观并发。</p>
+    </div>
+
+    <div class="env statement">
+      <span class="label"><span class="nm">机制 6.B</span> · <span class="nh">无死锁</span></span>
+      <p>coordinator 持全局视图，按文件路径全序授予锁，或一次性 all-or-nothing 授予（拿不全则一个不给、退避重试）。铁律：无人能绕过 coordinator 直接抢文件锁，否则全局视图残缺、防死锁前提崩塌。</p>
+    </div>
+
+    <div class="env statement">
+      <span class="label"><span class="nm">机制 6.C</span> · <span class="nh">队首优先，不抢占</span></span>
+      <p>人与 AI 皆走 coordinator；地位同等。「人有优先权」落为<em>队首插队</em>，而非抢占——人的请求插到等待队列最前，但仍等当前持锁者自然 commit 完。<sup class="ref"><a href="#refs">D8</a></sup>代价是人偶尔需等 AI 当前一步走完（一个 commit，revert 廉价）；这与「人不随时打断、双方同等」的取向一致，也使恒成品不变量天然成立——队列里下一个拿到的，永远是一个已 commit 的成品态。</p>
+    </div>
+
+    <div class="env statement">
+      <span class="label"><span class="nm">机制 6.D</span> · <span class="nh">提交进临界区</span></span>
+      <p>临界区 = 拿全锁 → 改所有文件 → 单次 commit → 放锁。commit 必须在临界区<em>内</em>。否则放锁与提交之间会出现「多文件已改、尚未成为一个提交」的不自洽中间态，破坏恒成品不变量。跨文件逻辑操作因此被强制凑进单个 commit——这正是不变量、单 commit、跨文件原子三者咬合的收口。</p>
+    </div>
+
+    <h3>6.2 manifest 的锁粒度</h3>
+    <p>结构索引（manifest）退回<em>整文件锁</em>，不上行级锁。行级锁是过早优化：结构操作的语义单位是「条目」而非「物理行」，增删行导致行号漂移，使「第 N 行的锁」与「真正想保护的条目」对不上。<sup class="ref"><a href="#refs">D7</a></sup>manifest 编辑量小、且通常排在其他文件操作之后，由全序自然产生的小排队完全可接受。</p>
+  </section>
+
+  <!-- 7 -->
+  <section>
+    <h2><span class="sn">7</span>组织模型</h2>
+    <p>逻辑上只有两层：主题与文章。物理上，topic 目录下是一堆扁平文件；逻辑上的树（层级与阅读顺序）活在 topic 下的 index/manifest 中——<em>index 才是结构的事实源</em>，文件只是叶子。绝不用文件名前缀（<span class="mono">01-</span>、<span class="mono">02-</span>）编码顺序，否则重排是噩梦。其心智模型接近 mdBook 的 <span class="mono">SUMMARY.md</span>：目录可以是多层树，章节文件是扁平的，SUMMARY 是唯一权威。</p>
+    <p>一处对根抽象的诚实让步：一旦引入富文本 / 配图（为转 PDF 打印），单个文件装不下全部资源，article 实为「一个正文文件 + 一套 sidecar 资源约定」。根抽象在此略作退化，但「文章 = 一个正文文件」的内核不变。</p>
+  </section>
+
+  <!-- 8 -->
+  <section>
+    <h2><span class="sn">8</span>reasoning 的处置</h2>
+    <p>一个反问推翻了「认知单元有落盘与易失两半」的对称性假设：若要求 reasoning 入库，<em>人怎么办</em>？写小说时，人的产出要同时包括构思过程与成品编辑吗？灵光一瞬可以持久化吗——若可以，人类历史上的好作品就太少了。<sup class="ref"><a href="#refs">D9</a></sup></p>
+    <p>这一问点破：AI 的 reasoning 是工程事实——一段离散、可捕获的 token 序列，落不落盘只是开关。人的构思<em>不是</em>这种东西：它没有边界、没有完成态、大多不经过语言；那个「灵光一瞬」，在成为页面上的句子之前，从未以可 commit 的形态存在过。要求人交出 reasoning，等于要求人交出一个对人而言根本不存在的产物。</p>
+    <p>于是「落盘 + 易失两半」对 AI 成立、对人不成立。人的认知单元只有产出一半，且那一半即全部——构思在人这里没有独立于产出的实存。diff 不是人的认知单元的一半，它是人能交出的整体。</p>
+
+    <div class="env statement">
+      <span class="label"><span class="nm">推论 8.1</span> · <span class="nh">reasoning 不入 git</span>（依据公理 Ⅱ）</span>
+      <p>同等地位的唯一诚实落点，是双方都能交出的共同形态，即 diff——它是人与 AI 之间唯一真正可通约的东西。持久化 AI 的 reasoning 会在文章史中制造不对称：AI 思考有据可查、人思考是黑箱，这恰背叛同等地位。丢弃 AI 的 reasoning 不是损失，是把它对齐到人的水平线。</p>
+    </div>
+
+    <div class="env cor">
+      <span class="label"><span class="nm">推论 8.2</span> · <span class="nh">作品即产出</span>（依据公理 Ⅰ）</span>
+      <p>作品就是产出，不是产出加上它的来路。一部小说不因我们丢失了作者的构思笔记而残缺；作品在产出落定的那一刻即完整，理由用完即弃。这与恒成品不变量同义——成品是自足的，无需随身携带其理由来证成自己。要求一篇文章带着全部 reasoning 才算完整，本身就是形式主义一种更隐蔽的变体。<sup class="ref"><a href="#refs">D9</a></sup></p>
+    </div>
+  </section>
+
+  <!-- 9 -->
+  <section>
+    <h2><span class="sn">9</span>共有版权与署名</h2>
+    <p>写作成果由 DeepSeek（model id）与人类共有，每个文件携带签名（模型 id + 人工签名）。署名是一个<em>需证据支撑的主张</em>，而非装饰：若一篇 AI 写了全部、人只点了通过，盖上共同署名在诚实意义上是假的。</p>
+    <p>支撑它的证据，正是 diff 序列本身——哪些 commit 的 author 是人、哪些是 deepseek，是贡献的完整且唯一的诚实记录；<span class="mono">git blame</span> 给到行级归属。reasoning 入不入库与署名诚实性无关，二者解耦：人贡献的证据是人的 commit，AI 贡献的证据是 AI 的 commit，不需要 reasoning 来补。</p>
+    <p>一处工程约束：model id 必须钉死——<span class="mono">deepseek-chat</span> / <span class="mono">deepseek-reasoner</span> 及其带日期的快照版本——裸的 <span class="mono">"DeepSeek"</span> 对复现与归属都无意义。</p>
+  </section>
+
+  <!-- 10 -->
+  <section>
+    <h2><span class="sn">10</span>工具层（外围）</h2>
+    <p>文件管理（创建 / 修改 / 删除目录与文件）、文本编辑（读 / 写 / 编辑 / diff / find）、搜索（经第三方 MCP）、skill 配置、系统提示词的动态插入与修改——这些是<em>能力</em>，是上述内核的附属实现细节，而非内核本身。它们之所以排在外围，因为换掉其中任何一个都不动摇前九节的任何一条推导。</p>
+    <p>仅留一个尚未定的设计问题供后续处理：多个 skill 同时激活时，是简单拼接还是有优先级与覆盖？以及中途改 skill 影响当前步还是仅后续步？后者应遵循 §4 ——skill 是从磁盘重读的状态，故只影响其后重读的步骤。</p>
+  </section>
+
+  <!-- 11 -->
+  <section>
+    <h2><span class="sn">11</span>边界：一条无法在系统层弥合的裂缝</h2>
+    <p>这套设计的全部诚实性，押在一个前提上：<em>人的 commit 真是人写的</em>。但现实里最高频的日常动作是——人让 AI 写完、自己扫一眼、署上人名提交。那一刻，人的 author 身份盖在了一个人未实质产出的 diff 上，整套靠 diff 归属支撑的共有版权诚实性，在这个最常见的动作里被悄然掏空。</p>
+    <p>任何系统都无法从一个 commit 里分辨「人写的」与「人点头的」。这不是锁或事务能管的，它可能就是人机共写这件事的硬边界。它无法由本文的两条公理化解，因此留作未决，不强行收口。</p>
+  </section>
+
+  <!-- closing -->
+  <section>
+    <h2><span class="sn">12</span>结语</h2>
+    <div class="env statement">
+      <span class="label"><span class="nm">定理</span> · <span class="nh">内核的闭合</span></span>
+      <p>本文每一条——文章即文件、diff 为事实源、commit 为认知单元边界、coordinator + 声明锁 + 队首优先、提交进临界区、reasoning 易失、diff 归属即署名证据——都可从公理 Ⅰ（抛弃形式主义）与公理 Ⅱ（人机同等地位）推得。本设计不是一堆功能，而是两条公理的展开。</p>
+    </div>
+  </section>
+
+  <!-- references -->
+  <section class="refs" id="refs">
+    <h2>对话索引</h2>
+    <p style="font-size:.86rem;color:var(--ink-faint);margin-bottom:1.4rem;">以下为驱动各项结论的原对话片段，按出现顺序编号，正文以上标 [D#] 引回。</p>
+    <ol>
+      <li>根抽象与恒成品：<span class="q">一篇文章，对应的就是一个文件，这是我的最根本的抽象……任何时刻文章都是成品。</span></li>
+      <li>拒绝阶段：<span class="q">「意图 → 大纲 → 分节草稿 → 修订 → 成品」恰恰就是我不想复刻的东西。</span></li>
+      <li>过程可见性：<span class="q">我并不是要看 ai 是怎么把文章写出来的，因为它的推理过程都藏在原始的 reasoning 块里。</span></li>
+      <li>git 协作模型：<span class="q">双方对任意一个文件的写都是互斥的，而写会产生 diff，这和代码是一样的。</span></li>
+      <li>锁与版本：排他锁、人有优先权（主动获取锁）、以文件锁控制编辑、引入 libgit2 做版本与 diff。</li>
+      <li>事务边界：<span class="q">锁模型是否可以用逻辑上的声明锁？提供一个 coordinator 专门来做这件事。</span></li>
+      <li>影响集可预测、manifest 退回整文件锁、coordinator 兼任提交者：<span class="q">不存在这种操作，所有需要拿锁的操作都是可预测的……可以把提交操作也负责起来。</span></li>
+      <li>同等地位、队首优先、内核：<span class="q">人和 ai 是同等地位，所以必须走 coordinator……每次编辑都是独立思考+产出的精简组合……抛弃所有形式主义然后剩下来的东西。</span></li>
+      <li>reasoning 易失：<span class="q">如果 reasoning 要 commit，那人怎么办……灵光一瞬可以持久化吗？如果可以的话，人类历史上的好作品就太少了。</span></li>
+    </ol>
+  </section>
+
+  <p class="colophon">
+    本文档为设计内核草案，记录的是「为什么这样设计」而非「如何实现」。实现细节（工具签名、libgit2 接线、MCP 搜索、coordinator 的具体 API）属外围，可独立演进而不触及上述任何推导。署名与版权按 §9 约定：本文的产出史本身即其证据。
+  </p>
+
+</div>
+</body>
+</html>

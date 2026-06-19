@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; }
+  body{ -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
+  ::selection{ background:rgba(122,46,46,.16); }
+  @keyframes slidein{ from{ opacity:0; transform:translateY(7px);} to{ opacity:1; transform:none;} }
+  @keyframes toastin{ from{ opacity:0; transform:translateY(10px) scale(.98);} to{ opacity:1; transform:none;} }
+  @keyframes softpulse{ 0%,100%{ opacity:1;} 50%{ opacity:.32;} }
+  @keyframes palettein{ from{ opacity:0; transform:translateY(-6px) scale(.985);} to{ opacity:1; transform:none;} }
+  [data-scroll]{ scrollbar-width:thin; scrollbar-color:#d3cec5 transparent; }
+  [data-scroll]::-webkit-scrollbar{ width:9px; height:9px; }
+  [data-scroll]::-webkit-scrollbar-thumb{ background:#d3cec5; border-radius:5px; border:2px solid transparent; background-clip:padding-box; }
+  [data-scroll]::-webkit-scrollbar-thumb:hover{ background:#c2bcb0; background-clip:padding-box; }
+  [contenteditable]:focus{ outline:none; }
+</style>
+</helmet>
+
+<div style="--paper:#fcfcfb; --cream:#f4f1ea; --cream2:#efe9dd; --card:#ffffff; --ink:#1b1a18; --inks:#45423c; --inkf:#6f6b62; --inkg:#9a958b; --accent:#7a2e2e; --accent-tint:rgba(122,46,46,.07); --rule:#d8d4cc; --rules:#e8e5de; --serif:Georgia,'Songti SC','Noto Serif SC',serif; --disp:'Palatino Linotype','Book Antiqua',Palatino,'Songti SC','Noto Serif SC',serif; --mono:'SF Mono',ui-monospace,'JetBrains Mono',Menlo,Consolas,monospace; font-family:var(--serif); color:var(--ink); background:var(--paper); width:1440px; height:900px; display:flex; flex-direction:column; overflow:hidden; font-size:15px;">
+
+  <!-- ============ TOP BAR ============ -->
+  <header style="flex:0 0 auto; height:54px; display:flex; align-items:center; gap:18px; padding:0 18px; background:var(--cream); border-bottom:1px solid var(--rule); position:relative; z-index:5;">
+    <div style="display:flex; align-items:baseline; gap:10px;">
+      <span style="font-family:var(--disp); font-weight:600; font-size:18px; letter-spacing:.01em;">AI-Write</span>
+      <span style="font-family:var(--disp); font-size:11px; letter-spacing:.26em; text-transform:uppercase; color:var(--inkg);">workspace</span>
+    </div>
+    <button style="display:flex; align-items:center; gap:7px; height:30px; padding:0 11px; background:transparent; border:1px solid var(--rule); border-radius:3px; cursor:pointer; font-family:var(--serif); font-size:13px; color:var(--inks);">
+      <span style="width:7px; height:7px; border-radius:50%; background:var(--accent);"></span>
+      Mouselee 的工作区
+      <span style="color:var(--inkg); font-size:11px;">▾</span>
+    </button>
+
+    <div style="flex:1;"></div>
+
+    <!-- connection / presence -->
+    <button onClick="{{ onCycleConn }}" title="点击切换实时状态" style="display:flex; align-items:center; gap:8px; height:30px; padding:0 12px; background:var(--card); border:1px solid var(--rule); border-radius:3px; cursor:pointer; font-family:var(--mono); font-size:12px; color:var(--inks);">
+      <span style="{{ connDotStyle }}"></span>
+      {{ connLabel }}
+    </button>
+
+    <!-- command palette entry -->
+    <button onClick="{{ onOpenPalette }}" style="display:flex; align-items:center; gap:9px; height:30px; padding:0 11px 0 12px; background:var(--card); border:1px solid var(--rule); border-radius:3px; cursor:pointer; color:var(--inkf);">
+      <span style="font-family:var(--serif); font-size:13px;">搜索 / 命令</span>
+      <kbd style="font-family:var(--mono); font-size:11px; color:var(--inks); background:var(--cream2); border:1px solid var(--rule); border-radius:3px; padding:1px 5px;">⌘K</kbd>
+    </button>
+  </header>
+
+  <!-- ============ BODY : THREE ZONES ============ -->
+  <div style="flex:1 1 auto; display:flex; min-height:0;">
+
+    <!-- ---------- NAVIGATOR ---------- -->
+    <nav style="flex:0 0 264px; display:flex; flex-direction:column; background:var(--cream); border-right:1px solid var(--rule); min-height:0;">
+      <div style="flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; padding:14px 16px 10px;">
+        <span style="font-family:var(--disp); font-size:11px; letter-spacing:.24em; text-transform:uppercase; color:var(--inkf);">Workspace</span>
+        <button title="新建主题" style="width:24px; height:24px; display:grid; place-items:center; background:transparent; border:1px solid var(--rule); border-radius:3px; cursor:pointer; color:var(--inks); font-size:15px; line-height:1;">+</button>
+      </div>
+      <div style="padding:0 14px 12px;">
+        <div style="display:flex; align-items:center; gap:8px; height:32px; padding:0 10px; background:var(--card); border:1px solid var(--rule); border-radius:3px;">
+          <span style="color:var(--inkg); font-size:13px;">⌕</span>
+          <input placeholder="检索标题 / 正文" style="flex:1; min-width:0; border:none; outline:none; background:transparent; font-family:var(--serif); font-size:13px; color:var(--ink);" />
+        </div>
+      </div>
+
+      <div data-scroll style="flex:1 1 auto; overflow:auto; padding:2px 8px 16px;">
+        <sc-for list="{{ tree }}" as="n" hint-placeholder-count="6">
+          <div onClick="{{ n.onClick }}" style="{{ n.rowStyle }}">
+            <span onClick="{{ n.onCaret }}" style="{{ n.caretStyle }}">{{ n.caret }}</span>
+            <span style="{{ n.dotStyle }}"></span>
+            <span style="{{ n.titleStyle }}">{{ n.title }}</span>
+            <span style="{{ n.badgeStyle }}">{{ n.badge }}</span>
+            <span style="{{ n.handleStyle }}">⠿</span>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="flex:0 0 auto; border-top:1px solid var(--rule); padding:11px 16px; display:flex; align-items:center; gap:9px; color:var(--inkf); font-size:12px;">
+        <span style="width:8px; height:8px; border-radius:50%; background:oklch(0.44 0.07 255);"></span>
+        <span style="font-family:var(--serif);">以「你」的身份协作</span>
+      </div>
+    </nav>
+
+    <!-- ---------- WORK SURFACE + INSPECTOR ---------- -->
+
+    <!-- ===== ARTICLE AUTHORING ===== -->
+    <sc-if value="{{ isArticle }}" hint-placeholder-val="{{ true }}">
+    <div style="flex:1 1 auto; display:flex; min-width:0; min-height:0;">
+
+      <!-- A. EDITOR CANVAS -->
+      <section style="flex:1 1 auto; display:flex; flex-direction:column; min-width:0; background:var(--paper);">
+        <!-- toolbar -->
+        <div style="flex:0 0 auto; display:flex; align-items:center; gap:14px; flex-wrap:wrap; padding:9px 22px; border-bottom:1px solid var(--rules); background:var(--paper);">
+          <!-- view / edit segmented -->
+          <div style="display:inline-flex; border:1px solid var(--rule); border-radius:4px; overflow:hidden;">
+            <button onClick="{{ onView }}" style="{{ viewBtnStyle }}">阅读</button>
+            <button onClick="{{ onEdit }}" style="{{ editBtnStyle }}">编辑</button>
+          </div>
+          <!-- authorship toggle -->
+          <button onClick="{{ onToggleAuthorship }}" title="{{ authTip }}" style="{{ authBtnStyle }}">
+            <span style="{{ authSwatchStyle }}"></span>作者着色
+          </button>
+
+          <div style="width:1px; height:20px; background:var(--rules);"></div>
+
+          <!-- format group -->
+          <div style="display:flex; align-items:center; gap:2px; {{ fmtGroupStyle }}">
+            <button style="{{ fmtBtn }}; font-weight:700;">B</button>
+            <button style="{{ fmtBtn }}; font-style:italic;">I</button>
+            <button style="{{ fmtBtn }}; font-family:var(--disp);">H₂</button>
+            <button style="{{ fmtBtn }}; font-family:var(--disp);">„</button>
+            <span style="width:1px; height:18px; background:var(--rules); margin:0 4px;"></span>
+            <button style="{{ fmtBtn }}">↶</button>
+            <button style="{{ fmtBtn }}">↷</button>
+          </div>
+
+          <div style="flex:1;"></div>
+
+          <button style="height:30px; padding:0 13px; background:var(--card); border:1px solid var(--rule); border-radius:4px; cursor:pointer; font-family:var(--serif); font-size:13px; color:var(--accent);">请 AI 编辑本段</button>
+          <button style="height:30px; padding:0 13px; background:var(--card); border:1px solid var(--rule); border-radius:4px; cursor:pointer; font-family:var(--serif); font-size:13px; color:var(--inks);">diff</button>
+          <!-- explore: layout -->
+          <div style="display:inline-flex; align-items:center; gap:7px; padding-left:4px;">
+            <span style="font-family:var(--mono); font-size:10px; letter-spacing:.1em; color:var(--inkg);">布局</span>
+            <div style="display:inline-flex; border:1px solid var(--rule); border-radius:4px; overflow:hidden;">
+              <button onClick="{{ onLayoutThree }}" style="{{ layoutThreeStyle }}">三栏</button>
+              <button onClick="{{ onLayoutMerged }}" style="{{ layoutMergedStyle }}">合并</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- busy banner (AI holds transaction) -->
+        <sc-if value="{{ showBusyBanner }}" hint-placeholder-val="{{ false }}">
+          <div style="flex:0 0 auto; display:flex; align-items:center; gap:11px; padding:9px 22px; background:oklch(0.96 0.02 62); border-bottom:1px solid oklch(0.88 0.04 62); color:oklch(0.4 0.06 50); font-size:13px;">
+            <span style="width:8px; height:8px; border-radius:50%; background:oklch(0.55 0.1 62); animation:softpulse 1.6s ease-in-out infinite;"></span>
+            <span><strong style="font-weight:600;">deepseek-reasoner</strong> 持有编辑事务 · 正文暂为只读</span>
+            <span style="flex:1;"></span>
+            <button onClick="{{ onRequestEdit }}" style="height:27px; padding:0 12px; background:var(--card); border:1px solid oklch(0.78 0.05 62); border-radius:4px; cursor:pointer; font-family:var(--serif); font-size:12px; color:oklch(0.38 0.07 50);">请求编辑(插队首)</button>
+          </div>
+        </sc-if>
+        <!-- your turn banner -->
+        <sc-if value="{{ showTurnBanner }}" hint-placeholder-val="{{ false }}">
+          <div style="flex:0 0 auto; display:flex; align-items:center; gap:11px; padding:9px 22px; background:oklch(0.96 0.025 150); border-bottom:1px solid oklch(0.86 0.05 150); color:oklch(0.36 0.06 150); font-size:13px;">
+            <span style="width:8px; height:8px; border-radius:50%; background:oklch(0.55 0.1 150);"></span>
+            <span><strong style="font-weight:600;">轮到你了</strong> · 编辑事务已交给你,正文进入可编辑态</span>
+          </div>
+        </sc-if>
+
+        <!-- canvas -->
+        <div data-scroll style="flex:1 1 auto; overflow:auto; padding:46px 22px 80px;">
+          <article style="max-width:680px; margin:0 auto;">
+            <div style="font-family:var(--disp); font-size:11px; letter-spacing:.24em; text-transform:uppercase; color:var(--inkg); margin-bottom:14px;">《夜行者》 · 短篇集</div>
+            <h1 style="font-family:var(--disp); font-weight:600; font-size:30px; line-height:1.25; letter-spacing:.005em; margin:0 0 12px;">第二章 · 便利店的光</h1>
+            <div style="display:flex; align-items:center; gap:14px; font-family:var(--mono); font-size:11.5px; color:var(--inkf); padding-bottom:18px; margin-bottom:8px; border-bottom:1px solid var(--rules);">
+              <span>HEAD · c8</span><span>·</span><span>{{ modeMeta }}</span><span>·</span><span>measure 68ch</span>
+            </div>
+
+            <!-- colored view -->
+            <sc-if value="{{ showColored }}" hint-placeholder-val="{{ false }}">
+              <div style="font-size:17px; line-height:1.95; color:var(--ink);">{{ coloredBody }}</div>
+              <div style="margin-top:30px; padding-top:16px; border-top:1px solid var(--rules); display:flex; flex-wrap:wrap; align-items:center; gap:8px;">
+                <span style="font-family:var(--mono); font-size:10px; letter-spacing:.12em; color:var(--inkg); margin-right:4px;">作者着色 · 显隐</span>
+                <sc-for list="{{ legend }}" as="lg" hint-placeholder-count="3">
+                  <span style="{{ lg.chipStyle }}"><span style="{{ lg.swatchStyle }}"></span>{{ lg.label }}</span>
+                </sc-for>
+                <span style="flex:1; min-width:14px;"></span>
+                <span style="font-family:var(--mono); font-size:10px; letter-spacing:.1em; color:var(--inkg);">表达</span>
+                <div style="display:inline-flex; border:1px solid var(--rule); border-radius:4px; overflow:hidden;">
+                  <button onClick="{{ onAdColor }}" style="{{ adColorStyle }}">色</button>
+                  <button onClick="{{ onAdTexture }}" style="{{ adTextureStyle }}">纹理</button>
+                  <button onClick="{{ onAdLabel }}" style="{{ adLabelStyle }}">标签</button>
+                </div>
+              </div>
+            </sc-if>
+
+            <!-- plain / editable view -->
+            <sc-if value="{{ showPlain }}" hint-placeholder-val="{{ true }}">
+              <div contenteditable="{{ isEdit }}" style="{{ plainBodyStyle }}">
+                <p style="margin:0 0 1.15rem; text-align:justify; text-wrap:pretty;">午夜的便利店,是城市留给夜行者的最后一盏灯。玻璃门一开一合,凉气与暖气在门口短暂地交换身份,而后又各自退回属于自己的那一侧。</p>
+                <p style="margin:0 0 1.15rem; text-align:justify; text-wrap:pretty;">他在关东煮的蒸汽前站了很久——不是因为饿,而是那点白雾让他想起小时候厨房的窗。收银员没有催他,只把找零推到台面靠他的那一端,动作轻得像怕惊动什么。</p>
+                <p style="margin:0 0 1.15rem; text-align:justify; text-wrap:pretty;">货架之间的过道窄得只容一人通过。他侧身让过一个抱着泡面的女孩,两人都没有说话,却在那一瞬里确认了彼此——同是这座城市里睡不着的人。</p>
+                <p style="margin:0 0 0; text-align:justify; text-wrap:pretty;">门又开了。冷空气灌进来,把最上层货架的吊牌吹得轻轻摇晃。他终于伸手,拿起那盒早已看好的牛奶。</p>
+              </div>
+            </sc-if>
+          </article>
+        </div>
+      </section>
+
+      <!-- B + C : INSPECTOR (three columns) -->
+      <sc-if value="{{ isThree }}" hint-placeholder-val="{{ true }}">
+        <!-- B. activity -->
+        <aside data-scroll style="flex:0 0 296px; overflow:auto; background:var(--cream); border-left:1px solid var(--rule); min-height:0;">
+          <div style="padding:14px 16px 10px;">
+            <span style="font-family:var(--disp); font-size:11px; letter-spacing:.22em; text-transform:uppercase; color:var(--inkf);">协作活动 · 本文</span>
+          </div>
+          {{ txnBlock }}
+          <div style="padding:6px 16px 0;">
+            <div style="font-family:var(--mono); font-size:10px; letter-spacing:.1em; color:var(--inkg); margin:6px 0 8px;">COMMAND STREAM</div>
+          </div>
+          <div style="padding:0 16px 22px;">
+            <sc-for list="{{ events }}" as="e" hint-placeholder-count="4">
+              <div style="{{ e.wrapStyle }}">
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:3px;">
+                  <span style="{{ e.dotStyle }}"></span>
+                  <span style="{{ e.authorStyle }}">{{ e.author }}</span>
+                  <span style="font-family:var(--mono); font-size:10px; color:var(--inkg); margin-left:auto;">{{ e.time }}</span>
+                </div>
+                <div style="font-size:13px; color:var(--inks); line-height:1.5; padding-left:16px;">{{ e.text }}</div>
+              </div>
+            </sc-for>
+          </div>
+        </aside>
+
+        <!-- C. versions -->
+        <aside data-scroll style="flex:0 0 320px; overflow:auto; background:var(--cream); border-left:1px solid var(--rule); min-height:0;">
+          {{ versionsPanel }}
+        </aside>
+      </sc-if>
+
+      <!-- merged inspector -->
+      <sc-if value="{{ isMerged }}" hint-placeholder-val="{{ false }}">
+        <aside style="flex:0 0 358px; display:flex; flex-direction:column; background:var(--cream); border-left:1px solid var(--rule); min-height:0;">
+          <div style="flex:0 0 auto; display:flex; border-bottom:1px solid var(--rule);">
+            <button onClick="{{ onTabVersions }}" style="{{ tabVersionsStyle }}">版本 · 署名</button>
+            <button onClick="{{ onTabActivity }}" style="{{ tabActivityStyle }}">活动流</button>
+          </div>
+          <div data-scroll style="flex:1 1 auto; overflow:auto; min-height:0;">
+            <sc-if value="{{ tabIsActivity }}" hint-placeholder-val="{{ false }}">
+              {{ txnBlock }}
+              <div style="padding:6px 16px 0;"><div style="font-family:var(--mono); font-size:10px; letter-spacing:.1em; color:var(--inkg); margin:6px 0 8px;">COMMAND STREAM</div></div>
+              <div style="padding:0 16px 22px;">
+                <sc-for list="{{ events }}" as="e" hint-placeholder-count="4">
+                  <div style="{{ e.wrapStyle }}">
+                    <div style="display:flex; align-items:center; gap:8px; margin-bottom:3px;">
+                      <span style="{{ e.dotStyle }}"></span>
+                      <span style="{{ e.authorStyle }}">{{ e.author }}</span>
+                      <span style="font-family:var(--mono); font-size:10px; color:var(--inkg); margin-left:auto;">{{ e.time }}</span>
+                    </div>
+                    <div style="font-size:13px; color:var(--inks); line-height:1.5; padding-left:16px;">{{ e.text }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-if>
+            <sc-if value="{{ tabIsVersions }}" hint-placeholder-val="{{ true }}">
+              {{ versionsPanel }}
+            </sc-if>
+          </div>
+        </aside>
+      </sc-if>
+
+    </div>
+    </sc-if>
+
+    <!-- ===== TOPIC ORCHESTRATION ===== -->
+    <sc-if value="{{ isTopic }}" hint-placeholder-val="{{ false }}">
+    <div style="flex:1 1 auto; display:flex; min-width:0; min-height:0;">
+      <section style="flex:1 1 auto; display:flex; flex-direction:column; min-width:0; background:var(--paper);">
+        <div style="flex:0 0 auto; padding:20px 28px 16px; border-bottom:1px solid var(--rules);">
+          <div style="font-family:var(--disp); font-size:11px; letter-spacing:.24em; text-transform:uppercase; color:var(--inkg); margin-bottom:8px;">编排 · Orchestration</div>
+          <h1 style="font-family:var(--disp); font-weight:600; font-size:26px; margin:0;">《夜行者》 · 短篇集</h1>
+          <p style="margin:8px 0 0; font-size:14px; color:var(--inkf); max-width:60ch;">与 master 对话下达主题级目标;master 规划、派发 writer、汇总回报。Topic 面是规划层,不显示正文。</p>
+        </div>
+        <div data-scroll style="flex:1 1 auto; overflow:auto; padding:24px 28px 28px;">
+          <div style="max-width:720px; margin:0 auto; display:flex; flex-direction:column; gap:20px;">
+            <!-- human goal bubble -->
+            <div style="align-self:flex-end; max-width:78%; background:oklch(0.96 0.012 255); border:1px solid oklch(0.88 0.02 255); border-radius:10px 10px 2px 10px; padding:12px 15px;">
+              <div style="font-family:var(--mono); font-size:10px; letter-spacing:.06em; color:oklch(0.44 0.07 255); margin-bottom:5px;">你 · 主题级目标</div>
+              <div style="font-size:14.5px; line-height:1.7; color:var(--ink);">写一个以「城市夜行者」为母题的短篇集,四到五篇,统一冷峻克制的笔调,第三人称。先把章节结构搭出来。</div>
+            </div>
+            <!-- master plan bubble -->
+            <div style="align-self:flex-start; max-width:88%; background:var(--card); border:1px solid var(--rule); border-radius:10px 10px 10px 2px; padding:14px 16px;">
+              <div style="display:flex; align-items:center; gap:8px; margin-bottom:9px;">
+                <span style="width:8px; height:8px; border-radius:50%; background:var(--accent);"></span>
+                <span style="font-family:var(--mono); font-size:10px; letter-spacing:.06em; color:var(--accent);">master · 规划 + 派发</span>
+              </div>
+              <div style="font-size:14.5px; line-height:1.7; color:var(--ink); margin-bottom:12px;">已确立母题与基调,拆为四个章节并建立阅读顺序;按文风把开篇环境交给 deepseek-chat,把内省段落交给 deepseek-reasoner,人保留定调与人称。</div>
+              <!-- structured product -->
+              <div style="border:1px solid var(--rules); border-radius:6px; overflow:hidden;">
+                <div style="padding:7px 12px; background:var(--cream2); font-family:var(--mono); font-size:10px; letter-spacing:.08em; color:var(--inkf);">创建 4 篇文章 · 派发 report</div>
+                <sc-for list="{{ orchItems }}" as="o" hint-placeholder-count="4">
+                  <div style="display:flex; align-items:center; gap:10px; padding:9px 12px; border-top:1px solid var(--rules);">
+                    <span style="{{ o.dotStyle }}"></span>
+                    <span style="font-size:13.5px; color:var(--ink); flex:1;">{{ o.title }}</span>
+                    <span style="font-family:var(--mono); font-size:10px; color:var(--inkf);">{{ o.writer }}</span>
+                    <span style="{{ o.badgeStyle }}">{{ o.badge }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            <!-- input -->
+            <div style="margin-top:6px; display:flex; gap:10px; align-items:flex-end; border:1px solid var(--rule); border-radius:8px; padding:10px 12px; background:var(--card);">
+              <textarea rows="2" placeholder="下达下一个主题级目标…" style="flex:1; resize:none; border:none; outline:none; background:transparent; font-family:var(--serif); font-size:14px; line-height:1.6; color:var(--ink);"></textarea>
+              <button style="height:32px; padding:0 16px; background:var(--accent); color:#fff; border:none; border-radius:5px; cursor:pointer; font-family:var(--serif); font-size:13px;">下达</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- topic inspector: theme config + operations -->
+      <aside data-scroll style="flex:0 0 340px; overflow:auto; background:var(--cream); border-left:1px solid var(--rule); min-height:0;">
+        <div style="padding:14px 16px 4px;"><span style="font-family:var(--disp); font-size:11px; letter-spacing:.22em; text-transform:uppercase; color:var(--inkf);">主题配置</span></div>
+        <div style="padding:8px 16px 16px; display:flex; flex-direction:column; gap:12px; border-bottom:1px solid var(--rule);">
+          <label style="display:flex; flex-direction:column; gap:5px;"><span style="font-size:12px; color:var(--inkf);">描述 / 目标</span><textarea rows="3" style="resize:none; border:1px solid var(--rule); border-radius:4px; padding:8px; background:var(--card); font-family:var(--serif); font-size:13px; color:var(--ink); outline:none;">冷峻克制、第三人称的城市夜行者群像。</textarea></label>
+          <label style="display:flex; flex-direction:column; gap:5px;"><span style="font-size:12px; color:var(--inkf);">默认 skill</span><div style="display:flex; align-items:center; justify-content:space-between; height:32px; padding:0 10px; border:1px solid var(--rule); border-radius:4px; background:var(--card); font-size:13px;">克制叙事 · 文学短篇<span style="color:var(--inkg);">▾</span></div></label>
+          <label style="display:flex; flex-direction:column; gap:5px;"><span style="font-size:12px; color:var(--inkf);">默认 writer model</span><div style="display:flex; align-items:center; justify-content:space-between; height:32px; padding:0 10px; border:1px solid var(--rule); border-radius:4px; background:var(--card); font-family:var(--mono); font-size:12px;">deepseek-reasoner-2026-05-28<span style="color:var(--inkg);">▾</span></div></label>
+        </div>
+        <div style="padding:14px 16px 4px;"><span style="font-family:var(--disp); font-size:11px; letter-spacing:.22em; text-transform:uppercase; color:var(--inkf);">AI 操作流</span></div>
+        <div style="padding:4px 16px 24px;">
+          <sc-for list="{{ ops }}" as="op" hint-placeholder-count="5">
+            <div style="display:flex; gap:10px; padding:7px 0; border-bottom:1px solid var(--rules);">
+              <span style="{{ op.tagStyle }}">{{ op.tag }}</span>
+              <span style="flex:1; font-size:12.5px; color:var(--inks); line-height:1.5;">{{ op.text }}</span>
+              <span style="font-family:var(--mono); font-size:10px; color:var(--inkg); white-space:nowrap;">{{ op.time }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </aside>
+    </div>
+    </sc-if>
+
+  </div>
+
+  <!-- ============ TOASTS ============ -->
+  <div style="position:fixed; right:20px; bottom:20px; display:flex; flex-direction:column; gap:9px; z-index:40; align-items:flex-end;">
+    <sc-for list="{{ toasts }}" as="t" hint-placeholder-count="0">
+      <div style="display:flex; align-items:center; gap:10px; padding:11px 15px; background:var(--ink); color:#f4f1ea; border-radius:6px; box-shadow:0 8px 24px rgba(27,26,24,.22); font-size:13px; animation:toastin .26s ease; max-width:340px;">
+        <span style="width:7px; height:7px; border-radius:50%; background:oklch(0.62 0.12 150);"></span>
+        {{ t.text }}
+      </div>
+    </sc-for>
+  </div>
+
+  <!-- ============ COMMAND PALETTE ============ -->
+  <sc-if value="{{ paletteOpen }}" hint-placeholder-val="{{ false }}">
+    <div onClick="{{ onClosePalette }}" style="position:fixed; inset:0; background:rgba(27,26,24,.32); z-index:60; display:flex; align-items:flex-start; justify-content:center; padding-top:13vh;">
+      <div onClick="{{ stop }}" style="width:560px; max-width:92vw; background:var(--paper); border:1px solid var(--rule); border-radius:10px; box-shadow:0 24px 64px rgba(27,26,24,.3); overflow:hidden; animation:palettein .18s ease;">
+        <div style="display:flex; align-items:center; gap:11px; padding:15px 18px; border-bottom:1px solid var(--rules);">
+          <span style="color:var(--inkg); font-size:16px;">⌕</span>
+          <input autofocus placeholder="跳转文章 · 发起编排 · 打开 diff · 撤销 · 切 skill" style="flex:1; border:none; outline:none; background:transparent; font-family:var(--serif); font-size:16px; color:var(--ink);" />
+          <kbd style="font-family:var(--mono); font-size:11px; color:var(--inkf); background:var(--cream2); border:1px solid var(--rule); border-radius:3px; padding:2px 6px;">esc</kbd>
+        </div>
+        <div style="padding:8px;">
+          <div style="font-family:var(--mono); font-size:10px; letter-spacing:.1em; color:var(--inkg); padding:6px 10px 4px;">动作</div>
+          <sc-for list="{{ commands }}" as="c" hint-placeholder-count="5">
+            <div onClick="{{ c.onRun }}" style="display:flex; align-items:center; gap:12px; padding:10px 12px; border-radius:6px; cursor:pointer;" style-hover="background:var(--cream);">
+              <span style="width:22px; text-align:center; color:var(--accent); font-family:var(--disp);">{{ c.icon }}</span>
+              <span style="flex:1; font-size:14px; color:var(--ink);">{{ c.label }}</span>
+              <span style="font-family:var(--mono); font-size:11px; color:var(--inkg);">{{ c.hint }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1440,&quot;height&quot;:900},&quot;layout&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;three&quot;,&quot;merged&quot;],&quot;default&quot;:&quot;three&quot;,&quot;tsType&quot;:&quot;'three'|'merged'&quot;},&quot;authorDisplay&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;color&quot;,&quot;texture&quot;,&quot;label&quot;],&quot;default&quot;:&quot;color&quot;,&quot;tsType&quot;:&quot;'color'|'texture'|'label'&quot;},&quot;timelineStyle&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;rail&quot;,&quot;list&quot;],&quot;default&quot;:&quot;rail&quot;,&quot;tsType&quot;:&quot;'rail'|'list'&quot;}}">
+class Component extends DCLogic {
+  constructor(props){
+    super(props);
+    this.AUTHORS = {
+      you:      { label:'你', short:'你', color:'oklch(0.44 0.075 255)', tint:'oklch(0.95 0.03 255)', deco:'solid',  id:'人工签名 · Mouselee' },
+      chat:     { label:'deepseek-chat', short:'DC', color:'oklch(0.45 0.08 152)', tint:'oklch(0.95 0.038 152)', deco:'dotted', id:'deepseek-chat-2026-05-28' },
+      reasoner: { label:'deepseek-reasoner', short:'DR', color:'oklch(0.47 0.09 62)', tint:'oklch(0.95 0.05 62)', deco:'dashed', id:'deepseek-reasoner-2026-05-28' },
+    };
+    this.PARAS = [
+      [{a:'you',t:'午夜的便利店,是城市留给夜行者的最后一盏灯。'},{a:'chat',t:'玻璃门一开一合,凉气与暖气在门口短暂地交换身份,而后又各自退回属于自己的那一侧。'}],
+      [{a:'reasoner',t:'他在关东煮的蒸汽前站了很久——不是因为饿,而是那点白雾让他想起小时候厨房的窗。'},{a:'you',t:'收银员没有催他,只把找零推到台面靠他的那一端,动作轻得像怕惊动什么。'}],
+      [{a:'chat',t:'货架之间的过道窄得只容一人通过。'},{a:'you',t:'他侧身让过一个抱着泡面的女孩,'},{a:'reasoner',t:'两人都没有说话,却在那一瞬里确认了彼此——同是这座城市里睡不着的人。'}],
+      [{a:'you',t:'门又开了。冷空气灌进来,把最上层货架的吊牌吹得轻轻摇晃。他终于伸手,拿起那盒早已看好的牛奶。'}],
+    ];
+    this.VERSIONS = [
+      {id:'c8',a:'you',msg:'改写第二段 · 收银员动作细节',time:'2 分钟前',head:true},
+      {id:'c7',a:'reasoner',msg:'补充过道相遇场景',time:'11 分钟前'},
+      {id:'c6',a:'chat',msg:'扩写开篇环境描写',time:'26 分钟前'},
+      {id:'c5',a:'you',msg:'确定章节基调与第三人称',time:'1 小时前'},
+      {id:'c4',a:'chat',msg:'生成初稿',time:'2 小时前'},
+      {id:'c3',a:'you',msg:'新建文章',time:'昨天 23:14'},
+    ];
+    this.COMP = [{a:'you',pct:38},{a:'chat',pct:34},{a:'reasoner',pct:28}];
+    this.NODES = [
+      {id:'t1',type:'topic',title:'《夜行者》· 短篇集',depth:0},
+      {id:'a1',type:'article',parent:'t1',title:'序 · 灯下',depth:1,a:'you'},
+      {id:'a2',type:'article',parent:'t1',title:'第一章 · 末班地铁',depth:1,a:'chat'},
+      {id:'a3',type:'article',parent:'t1',title:'第二章 · 便利店的光',depth:1,a:'you',badge:'live'},
+      {id:'a4',type:'article',parent:'t1',title:'第三章 · 天桥',depth:1,a:'reasoner'},
+      {id:'t2',type:'topic',title:'随笔 · 城市边缘',depth:0},
+    ];
+    this.ORCH = [
+      {a:'you',title:'序 · 灯下',writer:'人',badge:'已定稿'},
+      {a:'chat',title:'第一章 · 末班地铁',writer:'deepseek-chat',badge:'report ✓'},
+      {a:'you',title:'第二章 · 便利店的光',writer:'人 + reasoner',badge:'编辑中'},
+      {a:'reasoner',title:'第三章 · 天桥',writer:'deepseek-reasoner',badge:'report ✓'},
+    ];
+    this.OPS = [
+      {tag:'commit',a:'reasoner',text:'第三章 · 提交「天桥相遇」段落',time:'9:04'},
+      {tag:'tool',a:'reasoner',text:'edit_file · ch3.md',time:'9:03'},
+      {tag:'round',a:'reasoner',text:'round 4 · 重读全章评估节奏',time:'9:02'},
+      {tag:'slave',a:'chat',text:'writer 关闭 · 第一章 report 完成',time:'8:51'},
+      {tag:'commit',a:'chat',text:'第一章 · 提交初稿',time:'8:50'},
+    ];
+    this.FEED = [
+      {a:'reasoner',text:'round 7 · 重读第二段,评估收银员动作的节奏'},
+      {a:'reasoner',text:'edit_file · 第二段第 2 句'},
+      {a:'reasoner',text:'提交 · 收紧收银员动作描写'},
+    ];
+    this.state = {
+      sel:'article', selId:'a3', selTopic:'t1',
+      mode:'view', authorship:false,
+      txn:'ai-busy', conn:'live',
+      paletteOpen:false, toasts:[],
+      expanded:{ t1:true, t2:false },
+      mTab:'versions',
+      layout:null, authorDisplay:null, timelineStyle:null,
+      events:[
+        {a:'reasoner',type:'commit',text:'提交 · 补充过道相遇场景',time:'11 分钟前',id:'e1'},
+        {a:'chat',type:'commit',text:'提交 · 扩写开篇环境描写',time:'26 分钟前',id:'e2'},
+        {a:'you',type:'edit',text:'编辑 · 确定章节基调与人称',time:'1 小时前',id:'e3'},
+      ],
+    };
+  }
+
+  r(k, def){ return this.state[k] != null ? this.state[k] : (this.props[k] != null ? this.props[k] : def); }
+
+  componentDidMount(){
+    this._fi = 0;
+    this._timer = setInterval(()=>{
+      if(this.state.txn !== 'ai-busy'){ return; }
+      if(this._fi >= this.FEED.length){ return; }
+      const f = this.FEED[this._fi++];
+      const type = f.text.indexOf('提交') === 0 ? 'commit' : (f.text.indexOf('edit_file') === 0 ? 'tool' : 'round');
+      this.setState(s=>({ events:[{ ...f, type, time:'刚刚', id:'s'+Date.now() }, ...s.events] }));
+      if(type === 'commit'){ this.pushToast('deepseek-reasoner 提交了一处改动'); }
+    }, 5200);
+    this._key = (e)=>{
+      const k = (e.key||'').toLowerCase();
+      if((e.metaKey||e.ctrlKey) && k === 'k'){ e.preventDefault(); this.setState(s=>({ paletteOpen:!s.paletteOpen })); }
+      else if(e.key === 'Escape'){ this.setState({ paletteOpen:false }); }
+    };
+    window.addEventListener('keydown', this._key);
+  }
+  componentWillUnmount(){
+    clearInterval(this._timer);
+    if(this._qt){ clearTimeout(this._qt); }
+    window.removeEventListener('keydown', this._key);
+  }
+
+  pushToast(text){
+    const id = 't'+(this._tid = (this._tid||0)+1);
+    this.setState(s=>({ toasts:[...s.toasts, { id, text }] }));
+    setTimeout(()=>{ this.setState(s=>({ toasts:s.toasts.filter(t=>t.id!==id) })); }, 3400);
+  }
+
+  selectNode(id, type){
+    if(type === 'topic'){ this.setState(s=>({ sel:'topic', selTopic:id, expanded:{ ...s.expanded, [id]:true } })); }
+    else { this.setState({ sel:'article', selId:id }); }
+  }
+  toggleExpand(id, e){ if(e && e.stopPropagation) e.stopPropagation(); this.setState(s=>({ expanded:{ ...s.expanded, [id]:!s.expanded[id] } })); }
+
+  requestEdit(){
+    if(this.state.txn === 'ai-busy'){
+      this.setState({ txn:'queued' });
+      this.pushToast('已插入队首 · 当前 AI 提交后轮到你');
+      this._qt = setTimeout(()=>{
+        this.setState(s=>({ txn:'your-turn', mode:'edit', authorship:false,
+          events:[{ a:'you', type:'handoff', text:'取得编辑事务 · 轮到你了', time:'刚刚', id:'q'+Date.now() }, ...s.events] }));
+        this.pushToast('轮到你了 · 编辑权已交给你');
+      }, 3200);
+    } else {
+      this.setState({ mode:'edit' });
+    }
+  }
+  cancelQueue(){ if(this._qt){ clearTimeout(this._qt); } this.setState({ txn:'ai-busy' }); this.pushToast('已取消排队'); }
+  setView(){ this.setState({ mode:'view' }); }
+  setEdit(){ this.requestEdit(); }
+  toggleAuthorship(){ if(this.state.mode !== 'view'){ return; } this.setState(s=>({ authorship:!s.authorship })); }
+  cycleConn(){ const o=['live','reconnecting','offline']; const i=o.indexOf(this.state.conn); this.setState({ conn:o[(i+1)%3] }); }
+
+  runCommand(label){
+    this.setState({ paletteOpen:false });
+    if(label.indexOf('编排') >= 0){ this.setState({ sel:'topic', selTopic:'t1' }); }
+    else if(label.indexOf('撤销') >= 0){ this.pushToast('已撤销 · 还原为一次新 commit(历史不重写)'); }
+    else if(label.indexOf('着色') >= 0){ this.setState({ mode:'view', authorship:true }); }
+    else { this.pushToast(label); }
+  }
+
+  runStyle(a, mode){
+    const A = this.AUTHORS[a];
+    if(mode === 'texture'){
+      const hue = a==='you'?255:(a==='chat'?152:62);
+      const ang = a==='you'?45:(a==='chat'?-45:90);
+      return { backgroundImage:`repeating-linear-gradient(${ang}deg, oklch(0.5 0.09 ${hue} / .18) 0 2px, transparent 2px 5px)`, color:'var(--ink)', WebkitBoxDecorationBreak:'clone', boxDecorationBreak:'clone', padding:'1px 0' };
+    }
+    if(mode === 'label'){
+      return { background:A.tint, color:'var(--ink)', WebkitBoxDecorationBreak:'clone', boxDecorationBreak:'clone', padding:'1px 2px', borderRadius:'2px' };
+    }
+    return { color:A.color, borderBottom:`1.5px ${A.deco} ${A.color}`, paddingBottom:'1.5px' };
+  }
+
+  renderVals(){
+    const A = this.AUTHORS;
+    const layout = this.r('layout','three');
+    const ad = this.r('authorDisplay','color');
+    const tl = this.r('timelineStyle','rail');
+    const { sel, selId, mode, authorship, txn, conn, paletteOpen, mTab } = this.state;
+    const isArticle = sel === 'article';
+    const isTopic = sel === 'topic';
+    const isView = mode === 'view';
+    const isEdit = mode === 'edit';
+    const showColored = isArticle && isView && authorship;
+    const showPlain = !showColored;
+
+    // ---- tree ----
+    const tree = this.NODES.filter(n => n.type === 'topic' || this.state.expanded[n.parent]).map(n => {
+      const selected = (n.type === 'article' && n.id === selId && isArticle) || (n.type === 'topic' && n.id === this.state.selTopic && isTopic);
+      const isTop = n.type === 'topic';
+      const indent = 10 + n.depth * 15;
+      const rowStyle = `display:flex; align-items:center; gap:7px; height:32px; padding:0 8px 0 ${indent}px; margin:1px 0; border-radius:4px; cursor:pointer; user-select:none; background:${selected?'var(--accent-tint)':'transparent'}; box-shadow:${selected?'inset 2px 0 0 var(--accent)':'none'};`;
+      const caret = isTop ? (this.state.expanded[n.id] ? '▾' : '▸') : '';
+      const caretStyle = `width:13px; text-align:center; font-size:10px; color:var(--inkg); cursor:pointer; ${isTop?'':'visibility:hidden;'}`;
+      const dotStyle = isTop
+        ? `width:9px; height:9px; border:1.5px solid var(--inkf); border-radius:2px; flex:0 0 auto;`
+        : `width:8px; height:8px; border-radius:50%; flex:0 0 auto; background:${A[n.a].color};`;
+      const titleStyle = `flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:${isTop?'var(--disp)':'var(--serif)'}; font-size:${isTop?'14px':'13.5px'}; font-weight:${isTop?600:(selected?600:400)}; color:${selected?'var(--ink)':'var(--inks)'};`;
+      const badge = n.badge === 'live' ? '' : '';
+      const badgeStyle = n.badge === 'live'
+        ? `width:6px; height:6px; border-radius:50%; background:oklch(0.6 0.12 150); flex:0 0 auto; box-shadow:0 0 0 3px oklch(0.6 0.12 150 / .18);`
+        : 'display:none;';
+      const handleStyle = `color:var(--inkg); font-size:11px; opacity:.0; cursor:grab; flex:0 0 auto; ${isTop?'display:none;':''}`;
+      return { id:n.id, title:n.title, rowStyle, caret, caretStyle, dotStyle, titleStyle, badge, badgeStyle, handleStyle,
+        onClick:()=>this.selectNode(n.id, n.type), onCaret:(e)=>this.toggleExpand(n.id, e) };
+    });
+
+    // ---- connection ----
+    const connMap = {
+      live:{ label:'live', c:'oklch(0.6 0.12 150)', pulse:true },
+      reconnecting:{ label:'reconnecting', c:'oklch(0.72 0.13 70)', pulse:true },
+      offline:{ label:'offline', c:'var(--inkg)', pulse:false },
+    };
+    const cm = connMap[conn];
+    const connDotStyle = `width:8px; height:8px; border-radius:50%; background:${cm.c}; ${cm.pulse?'animation:softpulse 1.7s ease-in-out infinite;':''}`;
+
+    // ---- toolbar ----
+    const segBase = 'height:30px; padding:0 14px; border:none; cursor:pointer; font-family:var(--serif); font-size:13px;';
+    const segOn = segBase + 'background:var(--ink); color:var(--paper);';
+    const segOff = segBase + 'background:var(--card); color:var(--inks);';
+    const viewBtnStyle = isView ? segOn : segOff;
+    const editBtnStyle = isEdit ? segOn : segOff;
+    const authActive = authorship && isView;
+    const authBtnStyle = `display:inline-flex; align-items:center; gap:7px; height:30px; padding:0 12px; border:1px solid ${authActive?'var(--accent)':'var(--rule)'}; border-radius:4px; cursor:${isView?'pointer':'not-allowed'}; font-family:var(--serif); font-size:13px; color:${authActive?'var(--accent)':(isView?'var(--inks)':'var(--inkg)')}; background:${authActive?'var(--accent-tint)':'var(--card)'}; opacity:${isView?1:.5};`;
+    const authSwatchStyle = `width:14px; height:10px; border-radius:2px; background:${authActive?'linear-gradient(90deg, oklch(0.44 0.075 255) 0 33%, oklch(0.45 0.08 152) 33% 66%, oklch(0.47 0.09 62) 66%)':'var(--rules)'};`;
+    const authTip = isView ? '正文按作者游程着色(仅阅读模式可开)' : '编辑模式不着色(§11·2)';
+    const fmtGroupStyle = isEdit ? 'opacity:1;' : 'opacity:.4; pointer-events:none;';
+    const fmtBtn = 'width:30px; height:30px; display:grid; place-items:center; background:var(--card); border:1px solid var(--rule); border-radius:4px; cursor:pointer; font-family:var(--serif); font-size:14px; color:var(--inks);';
+    const segS = 'height:26px; padding:0 11px; border:none; cursor:pointer; font-family:var(--serif); font-size:12px;';
+    const onS = segS + 'background:var(--ink); color:var(--paper);';
+    const offS = segS + 'background:var(--card); color:var(--inks);';
+    const layoutThreeStyle = layout==='three'?onS:offS;
+    const layoutMergedStyle = layout==='merged'?onS:offS;
+
+    // ---- canvas ----
+    const modeMeta = isEdit ? 'edit · 编辑事务在你' : (authorship ? 'view · 作者着色 on' : 'view');
+    const plainBodyStyle = `font-size:17px; line-height:1.95; color:var(--ink); ${isEdit?'border:1px solid var(--rule); border-radius:4px; padding:18px 20px; background:var(--card); box-shadow:0 1px 0 var(--rules);':''}`;
+
+    // ---- colored body ----
+    const ce = React.createElement;
+    const coloredBody = ce('div', null, this.PARAS.map((para, pi)=>
+      ce('p', { key:pi, style:{ margin: pi===this.PARAS.length-1?'0':'0 0 1.15rem', textAlign:'justify', textWrap:'pretty' } },
+        para.map((run, ri)=>{
+          const st = this.runStyle(run.a, ad);
+          const children = [run.t];
+          if(ad === 'label'){ children.push(ce('sub', { key:'l', style:{ fontFamily:'var(--mono)', fontSize:'8px', fontWeight:600, color:A[run.a].color, verticalAlign:'super', marginLeft:'1px', letterSpacing:'.02em' } }, A[run.a].short)); }
+          return ce('span', { key:ri, style:st }, children);
+        })
+      )
+    ));
+    const legend = ['you','chat','reasoner'].map(k=>{
+      const sw = ad==='texture'
+        ? `width:13px; height:13px; border-radius:2px; flex:0 0 auto; background-image:repeating-linear-gradient(${k==='you'?45:(k==='chat'?-45:90)}deg, oklch(0.5 0.09 ${k==='you'?255:(k==='chat'?152:62)} / .45) 0 2px, transparent 2px 5px); border:1px solid var(--rules);`
+        : `width:13px; height:13px; border-radius:2px; flex:0 0 auto; background:${ad==='label'?A[k].tint:A[k].color}; border:${ad==='label'?'1px solid '+A[k].color:'none'};`;
+      return { label:A[k].label, chipStyle:'display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11px; color:var(--inks);', swatchStyle:sw };
+    });
+    const adBtn = 'height:26px; padding:0 10px; border:none; cursor:pointer; font-family:var(--serif); font-size:12px;';
+    const adOn = adBtn+'background:var(--ink); color:var(--paper);';
+    const adOff = adBtn+'background:var(--card); color:var(--inks);';
+
+    // ---- transaction block (React node, reused) ----
+    const txnHolder = ce('div', { style:{ padding:'0 16px' } },
+      ce('div', { style:{ border:'1px solid var(--rule)', borderRadius:'6px', background:'var(--card)', overflow:'hidden' } }, [
+        ce('div', { key:'h', style:{ padding:'7px 11px', background:'var(--cream2)', fontFamily:'var(--mono)', fontSize:'10px', letterSpacing:'.08em', color:'var(--inkf)' } }, 'COORDINATOR · 事务'),
+        // holder row
+        ce('div', { key:'hold', style:{ display:'flex', alignItems:'center', gap:'8px', padding:'9px 11px' } }, [
+          ce('span', { key:'d', style:{ width:'8px', height:'8px', borderRadius:'50%', background: txn==='your-turn'?'oklch(0.55 0.1 150)':'oklch(0.55 0.1 62)', animation: txn==='ai-busy'||txn==='queued'?'softpulse 1.6s ease-in-out infinite':'none' } }),
+          ce('span', { key:'t', style:{ fontSize:'12.5px', color:'var(--inks)' } },
+            txn==='your-turn' ? ['持锁:', ce('strong',{key:'s',style:{fontWeight:600,color:'oklch(0.36 0.06 150)'}},' 你')]
+                              : ['持锁:', ce('strong',{key:'s',style:{fontWeight:600,color:A.reasoner.color}},' deepseek-reasoner')]),
+          ce('span', { key:'st', style:{ marginLeft:'auto', fontFamily:'var(--mono)', fontSize:'10px', color:'var(--inkg)' } }, txn==='your-turn'?'editing':'committing'),
+        ]),
+        // queued row
+        txn==='queued' ? ce('div', { key:'q', style:{ display:'flex', alignItems:'center', gap:'8px', padding:'9px 11px', borderTop:'1px solid var(--rules)', background:'oklch(0.97 0.012 255)' } }, [
+          ce('span', { key:'d', style:{ width:'7px', height:'7px', borderRadius:'50%', border:'1.5px solid oklch(0.44 0.075 255)' } }),
+          ce('span', { key:'t', style:{ fontSize:'12.5px', color:'oklch(0.4 0.06 255)' } }, '你 · 排队中 · 当前提交后轮到你'),
+          ce('button', { key:'c', onClick:()=>this.cancelQueue(), style:{ marginLeft:'auto', height:'24px', padding:'0 9px', background:'var(--card)', border:'1px solid var(--rule)', borderRadius:'4px', cursor:'pointer', fontFamily:'var(--serif)', fontSize:'11px', color:'var(--inks)' } }, '取消'),
+        ]) : null,
+        txn==='your-turn' ? ce('div', { key:'yt', style:{ padding:'8px 11px', borderTop:'1px solid var(--rules)', fontSize:'11.5px', color:'oklch(0.4 0.05 150)' } }, '队列空 · 编辑权在你,落定即一次 commit') : null,
+        txn==='ai-busy' ? ce('button', { key:'rq', onClick:()=>this.requestEdit(), style:{ display:'block', width:'100%', padding:'8px 11px', borderTop:'1px solid var(--rules)', background:'transparent', border:'none', cursor:'pointer', fontFamily:'var(--serif)', fontSize:'12px', color:'var(--accent)', textAlign:'left' } }, '请求编辑 · 插入队首(不打断当前提交)') : null,
+      ])
+    );
+    const txnBlock = ce('div', { style:{ paddingTop:'2px' } }, txnHolder);
+
+    // ---- events ----
+    const events = this.state.events.map((e, i)=>{
+      const c = A[e.a].color;
+      return {
+        id:e.id || ('ev'+i), author:A[e.a].label, time:e.time, text:e.text,
+        wrapStyle:`padding:9px 0; border-bottom:1px solid var(--rules); ${i===0 && (e.time==='刚刚')?'animation:slidein .3s ease;':''}`,
+        dotStyle:`width:7px; height:7px; border-radius:50%; flex:0 0 auto; background:${c};`,
+        authorStyle:`font-family:var(--mono); font-size:11px; color:${c};`,
+      };
+    });
+
+    // ---- versions panel (React node) ----
+    const verItems = this.VERSIONS.map((v, i)=>{
+      const c = A[v.a].color;
+      const isRail = tl === 'rail';
+      const dot = ce('span', { key:'d', style:{ width: v.head?'11px':'9px', height: v.head?'11px':'9px', borderRadius:'50%', background:c, flex:'0 0 auto', boxShadow: v.head?`0 0 0 3px ${A[v.a].tint}`:'none', marginTop:'3px', zIndex:1 } });
+      const body = ce('div', { key:'b', style:{ flex:1, minWidth:0 } }, [
+        ce('div', { key:'m', style:{ fontSize:'13px', color:'var(--ink)', lineHeight:1.45 } }, v.msg),
+        ce('div', { key:'meta', style:{ display:'flex', alignItems:'center', gap:'8px', marginTop:'3px' } }, [
+          ce('span', { key:'a', style:{ fontFamily:'var(--mono)', fontSize:'10px', color:c } }, v.a==='you'?'你':A[v.a].id),
+          ce('span', { key:'t', style:{ fontFamily:'var(--mono)', fontSize:'10px', color:'var(--inkg)' } }, '· '+v.time),
+          v.head?ce('span',{key:'h',style:{ fontFamily:'var(--mono)', fontSize:'9px', letterSpacing:'.08em', color:'var(--accent)', border:'1px solid var(--accent)', borderRadius:'3px', padding:'0 4px' }},'HEAD'):null,
+        ]),
+      ]);
+      if(isRail){
+        return ce('div', { key:v.id, style:{ display:'flex', gap:'11px', position:'relative', paddingBottom:'16px' } }, [
+          i < this.VERSIONS.length-1 ? ce('span',{key:'line',style:{ position:'absolute', left: v.head?'5px':'4px', top:'14px', bottom:'-2px', width:'1.5px', background:'var(--rules)' }}) : null,
+          dot, body,
+        ]);
+      }
+      return ce('div', { key:v.id, style:{ display:'flex', gap:'10px', alignItems:'flex-start', padding:'10px 0', borderBottom:'1px solid var(--rules)' } }, [dot, body]);
+    });
+    const tlBtn = 'height:24px; padding:0 9px; border:none; cursor:pointer; font-family:var(--serif); font-size:11px;';
+    const compBars = this.COMP.map(c=> ce('div',{key:c.a,style:{display:'flex',alignItems:'center',gap:'9px'}},[
+      ce('span',{key:'l',style:{ width:'112px', fontFamily:'var(--mono)', fontSize:'10px', color:A[c.a].color, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}, c.a==='you'?'你':A[c.a].label),
+      ce('span',{key:'bar',style:{ flex:1, height:'7px', background:'var(--rules)', borderRadius:'4px', overflow:'hidden' }}, ce('span',{style:{ display:'block', height:'100%', width:c.pct+'%', background:A[c.a].color }})),
+      ce('span',{key:'p',style:{ fontFamily:'var(--mono)', fontSize:'11px', color:'var(--inks)', width:'30px', textAlign:'right' }}, c.pct+'%'),
+    ]));
+    const versionsPanel = ce('div', null, [
+      ce('div', { key:'hd', style:{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'14px 16px 8px' } }, [
+        ce('span', { key:'t', style:{ fontFamily:'var(--disp)', fontSize:'11px', letterSpacing:'.22em', textTransform:'uppercase', color:'var(--inkf)' } }, '版本 · 署名'),
+        ce('div', { key:'tg', style:{ display:'inline-flex', border:'1px solid var(--rule)', borderRadius:'4px', overflow:'hidden' } }, [
+          ce('button', { key:'r', onClick:()=>this.setState({timelineStyle:'rail'}), style:{ ...this._btnObj(tlBtn), background: tl==='rail'?'var(--ink)':'var(--card)', color: tl==='rail'?'var(--paper)':'var(--inks)' } }, '时间线'),
+          ce('button', { key:'l', onClick:()=>this.setState({timelineStyle:'list'}), style:{ ...this._btnObj(tlBtn), background: tl==='list'?'var(--ink)':'var(--card)', color: tl==='list'?'var(--paper)':'var(--inks)' } }, '列表'),
+        ]),
+      ]),
+      ce('div', { key:'list', style:{ padding:'8px 16px 4px' } }, verItems),
+      ce('div', { key:'blame', style:{ margin:'4px 16px 0', padding:'10px 12px', background:'var(--card)', border:'1px solid var(--rule)', borderRadius:'6px', display:'flex', gap:'9px', alignItems:'flex-start' } }, [
+        ce('span',{key:'i',style:{fontFamily:'var(--mono)',fontSize:'10px',color:'var(--accent)',marginTop:'1px'}},'blame'),
+        ce('span',{key:'t',style:{fontSize:'11.5px',color:'var(--inkf)',lineHeight:1.5}},'选两版可 side-by-side diff;逐行归属经 git blame 还原。revert 自身也是一次 commit,永不重写历史。'),
+      ]),
+      // signature card
+      ce('div', { key:'sig', style:{ margin:'16px 16px 24px', border:'1px solid var(--rule)', borderRadius:'8px', overflow:'hidden', background:'var(--card)' } }, [
+        ce('div',{key:'h',style:{ padding:'9px 13px', borderBottom:'1px solid var(--rules)', fontFamily:'var(--disp)', fontSize:'11px', letterSpacing:'.18em', textTransform:'uppercase', color:'var(--inkf)' }},'共有署名 · 证据'),
+        ce('div',{key:'body',style:{ padding:'12px 13px', display:'flex', flexDirection:'column', gap:'9px' }}, compBars),
+        ce('div',{key:'ids',style:{ padding:'0 13px 12px', display:'flex', flexDirection:'column', gap:'4px' }}, ['you','chat','reasoner'].map(k=>
+          ce('div',{key:k,style:{ fontFamily:'var(--mono)', fontSize:'10px', color:'var(--inkf)' }}, A[k].id))),
+        ce('div',{key:'note',style:{ padding:'9px 13px', borderTop:'1px solid var(--rules)', fontSize:'11px', color:'var(--inkg)', lineHeight:1.5 }}, '诚实边界:不提供「已验证人类原创」徽章;只呈现 commit 作者分布这一事实(内核 §11)。'),
+      ]),
+    ]);
+
+    // ---- orchestration items ----
+    const orchItems = this.ORCH.map((o,i)=>{
+      const c = A[o.a].color;
+      const done = o.badge.indexOf('✓')>=0 || o.badge.indexOf('定稿')>=0;
+      const editing = o.badge.indexOf('编辑')>=0;
+      return { title:o.title, writer:o.writer, badge:o.badge,
+        dotStyle:`width:8px; height:8px; border-radius:50%; flex:0 0 auto; background:${c};`,
+        badgeStyle:`font-family:var(--mono); font-size:10px; padding:2px 7px; border-radius:10px; white-space:nowrap; ${editing?'background:oklch(0.96 0.025 62); color:oklch(0.42 0.07 50); border:1px solid oklch(0.86 0.04 62);':(done?'background:oklch(0.96 0.025 150); color:oklch(0.38 0.06 150); border:1px solid oklch(0.86 0.04 150);':'background:var(--cream2); color:var(--inkf); border:1px solid var(--rule);')}` };
+    });
+    const ops = this.OPS.map(op=>{
+      const tagColor = { commit:'var(--accent)', tool:'oklch(0.45 0.08 152)', round:'var(--inkf)', slave:'oklch(0.47 0.09 62)' }[op.tag];
+      return { tag:op.tag, text:op.text, time:op.time,
+        tagStyle:`font-family:var(--mono); font-size:9.5px; letter-spacing:.04em; text-transform:uppercase; color:${tagColor}; border:1px solid ${tagColor}; border-radius:3px; padding:1px 5px; height:fit-content; white-space:nowrap;` };
+    });
+
+    // ---- merged tabs ----
+    const tabBase = 'flex:1; height:42px; border:none; cursor:pointer; font-family:var(--disp); font-size:12px; letter-spacing:.04em;';
+    const tabVersionsStyle = tabBase + (mTab==='versions'?'background:var(--cream); color:var(--ink); box-shadow:inset 0 -2px 0 var(--accent);':'background:var(--cream2); color:var(--inkf);');
+    const tabActivityStyle = tabBase + (mTab==='activity'?'background:var(--cream); color:var(--ink); box-shadow:inset 0 -2px 0 var(--accent);':'background:var(--cream2); color:var(--inkf);');
+
+    // ---- commands ----
+    const cmds = [
+      { icon:'⤳', label:'跳转文章…', hint:'enter' },
+      { icon:'✦', label:'发起编排(切到 Topic 面)', hint:'' },
+      { icon:'≋', label:'打开 diff · 对比两版', hint:'' },
+      { icon:'↺', label:'撤销上一步(落为新 commit)', hint:'⌘Z' },
+      { icon:'◐', label:'开启作者着色', hint:'' },
+      { icon:'＃', label:'切换 skill…', hint:'' },
+    ];
+    const commands = cmds.map(c=>({ ...c, onRun:()=>this.runCommand(c.label) }));
+
+    return {
+      tree,
+      connLabel:cm.label, connDotStyle, onCycleConn:()=>this.cycleConn(),
+      onOpenPalette:()=>this.setState({ paletteOpen:true }),
+      isArticle, isTopic, isView, isEdit,
+      isThree: layout==='three', isMerged: layout==='merged',
+      onView:()=>this.setView(), onEdit:()=>this.setEdit(),
+      viewBtnStyle, editBtnStyle,
+      onToggleAuthorship:()=>this.toggleAuthorship(), authBtnStyle, authSwatchStyle, authTip,
+      fmtGroupStyle, fmtBtn,
+      onLayoutThree:()=>this.setState({layout:'three'}), onLayoutMerged:()=>this.setState({layout:'merged'}),
+      layoutThreeStyle, layoutMergedStyle,
+      showBusyBanner: isArticle && txn==='ai-busy' && isView,
+      showTurnBanner: isArticle && txn==='your-turn',
+      onRequestEdit:()=>this.requestEdit(),
+      modeMeta, plainBodyStyle,
+      showColored, showPlain, coloredBody, legend,
+      onAdColor:()=>this.setState({authorDisplay:'color'}), onAdTexture:()=>this.setState({authorDisplay:'texture'}), onAdLabel:()=>this.setState({authorDisplay:'label'}),
+      adColorStyle: ad==='color'?adOn:adOff, adTextureStyle: ad==='texture'?adOn:adOff, adLabelStyle: ad==='label'?adOn:adOff,
+      txnBlock, events,
+      versionsPanel,
+      orchItems, ops,
+      onTabVersions:()=>this.setState({mTab:'versions'}), onTabActivity:()=>this.setState({mTab:'activity'}),
+      tabVersionsStyle, tabActivityStyle, tabIsActivity: mTab==='activity', tabIsVersions: mTab==='versions',
+      toasts:this.state.toasts,
+      paletteOpen, onClosePalette:()=>this.setState({paletteOpen:false}), stop:(e)=>{ if(e&&e.stopPropagation) e.stopPropagation(); }, commands,
+    };
+  }
+
+  _btnObj(s){ const o={}; s.split(';').forEach(p=>{ const i=p.indexOf(':'); if(i<0) return; const k=p.slice(0,i).trim().replace(/-([a-z])/g,(m,c)=>c.toUpperCase()); const v=p.slice(i+1).trim(); if(k) o[k]=v; }); return o; }
+}
+</script>
+</body>
+</html>
